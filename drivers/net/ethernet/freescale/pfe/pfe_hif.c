@@ -43,6 +43,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/lockdep.h>
 #include <linux/skbuff.h>
 #include <linux/string.h>
 
@@ -303,12 +304,14 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 /*
  * Detach remaining in-flight TX descriptors and skbs from a closing client
  * queue so late TX completions release DMA/skb resources safely without
- * referencing a reopened client session.
+ * referencing a reopened client session. Must be called with hif->tx_lock held.
  */
 void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 			      struct hif_client_tx_queue *q)
 {
 	unsigned int active, idx, i = 0;
+
+	lockdep_assert_held(&hif->tx_lock);
 
 	if (unlikely(!q || !q->base))
 		return;
@@ -381,7 +384,7 @@ static void *client_put_rxpacket(struct pfe_hif *hif, void *pkt, u32 len, u32 fl
 
 	free_pkt = pfe_hif_spare_buf_get();
 	if (!free_pkt)
-		free_pkt = pfe_hif_buf_alloc(hif->dev, GFP_ATOMIC);
+		free_pkt = pfe_hif_buf_alloc(hif->dev);
 	if (!free_pkt)
 		return NULL;
 
@@ -434,8 +437,6 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 
 		/* Ensure DMA writes to packet buffer complete before reading it. */
 		dma_rmb();
-
-		hif->napi_counters[NAPI_DESC_COUNT]++;
 
 		len = BD_BUF_LEN(ctrl);
 
@@ -523,6 +524,7 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 		retried_full = false;
 
 pkt_drop:
+		hif->napi_counters[NAPI_DESC_COUNT]++;
 		hif->rx_buf_addr[rtc] = free_buf;
 		/* The drop path re-posts the (now unmapped) buffer itself. */
 		if (!pfe_hif_buf_dma(free_buf) && !pfe_hif_buf_map(hif->dev, free_buf)) {
@@ -797,6 +799,19 @@ void hif_process_client_req(struct pfe_hif *hif, int req, int data1, int data2)
 	}
 }
 
+static bool pfe_hif_has_completed_tx(struct pfe_hif *hif)
+{
+	bool completed = false;
+
+	spin_lock_bh(&hif->tx_lock);
+	if (hif->TxAvail < hif->TxRingSize &&
+	    !(READ_ONCE(hif->TxBase[hif->Txtoclean].ctrl) & BD_CTRL_DESC_EN))
+		completed = true;
+	spin_unlock_bh(&hif->tx_lock);
+
+	return completed;
+}
+
 static void pfe_hif_tx_poll_notify(struct pfe_hif *hif)
 {
 	unsigned long clients = READ_ONCE(hif->tx_irq_clients);
@@ -805,7 +820,7 @@ static void pfe_hif_tx_poll_notify(struct pfe_hif *hif)
 	if (!clients)
 		return;
 
-	hif_tx_done_process(hif, TX_FREE_MAX_COUNT);
+	hif_tx_done_process(hif, hif->TxRingSize);
 
 	for_each_set_bit(client_id, &clients, HIF_CLIENTS_MAX) {
 		if (hif->shm->gClient_status & (1 << client_id))
@@ -817,13 +832,15 @@ static int pfe_hif_rx_poll(struct napi_struct *napi, int budget)
 {
 	struct pfe_hif *hif = container_of(napi, struct pfe_hif, napi);
 	int work_done;
+	bool tx_more;
 
 	hif->napi_counters[NAPI_POLL_COUNT]++;
 
 	work_done = pfe_hif_rx_process(hif, budget);
 	pfe_hif_tx_poll_notify(hif);
+	tx_more = READ_ONCE(hif->tx_irq_clients) && pfe_hif_has_completed_tx(hif);
 
-	if (work_done < budget) {
+	if (work_done < budget && !tx_more) {
 		unsigned long flags;
 
 		spin_lock_irqsave(&hif->irq_lock, flags);
@@ -837,6 +854,7 @@ static int pfe_hif_rx_poll(struct napi_struct *napi, int budget)
 		spin_unlock_irqrestore(&hif->irq_lock, flags);
 	} else {
 		hif->napi_counters[NAPI_FULL_BUDGET_COUNT]++;
+		return budget;
 	}
 
 	return work_done;

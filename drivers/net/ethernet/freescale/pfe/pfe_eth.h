@@ -13,9 +13,9 @@
  * Stage P5 -- see pfe_hif.c's single shared struct pfe_hif.napi -- so a
  * second, per-client NAPI layer doesn't apply here the way it did to
  * the vendor's 3.2.26 architecture), the TX path's per-queue timers/
- * DMA-map bookkeeping/credit accounting (needed for TSO and multi-queue
- * QoS, neither of which this port implements), and everything tied to
- * ethtool/sysfs stats reporting that was never ported to begin with.
+ * credit accounting (needed for TSO and multi-queue QoS, neither of which
+ * this port implements), and everything tied to legacy stats reporting
+ * that was never ported to begin with.
  */
 #ifndef _PFE_ETH_H_
 #define _PFE_ETH_H_

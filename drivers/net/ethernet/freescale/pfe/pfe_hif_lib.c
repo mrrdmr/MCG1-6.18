@@ -5,7 +5,7 @@
  * mspd-c2k/pfe/ in symops/MCG1-3.2.26).
  *
  * Stage P5 added the Rx buffer pool and event indication; Stage P7
- * added client registration; Stage P8 adds the TX submission path and
+ * added client registration; Stage P8 adds the SG TX submission path and
  * the Rx dequeue/re-arm pair (hif_lib_receive_pkt()/
  * hif_lib_event_handler_start()) -- see pfe_hif_lib.h for what's still
  * out of scope (TSO, TX credit/QoS).
@@ -20,6 +20,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/log2.h>
 #include <linux/netdevice.h>
 #include <linux/slab.h>
 
@@ -47,7 +48,7 @@ static int pfe_hif_spare_pool_init(struct device *dev)
 	int i;
 
 	for (i = 0; i < HIF_RX_DESC_NT; i++) {
-		void *buf = pfe_hif_buf_alloc(dev, GFP_KERNEL);
+		void *buf = pfe_hif_buf_alloc(dev);
 
 		if (!buf) {
 			while (i-- > 0)
@@ -137,7 +138,7 @@ static int pfe_hif_shm_init(struct device *dev, struct hif_shm *hif_shm)
 	hif_shm->rx_buf_pool_cnt = HIF_RX_DESC_NT;
 
 	for (i = 0; i < hif_shm->rx_buf_pool_cnt; i++) {
-		pkt = pfe_hif_buf_alloc(dev, GFP_KERNEL);
+		pkt = pfe_hif_buf_alloc(dev);
 		if (!pkt)
 			goto err;
 
@@ -272,6 +273,14 @@ int hif_lib_client_register(struct hif_client_s *client)
 
 	if (!client || !client->pfe || client->id < 0 ||
 	    client->id >= HIF_CLIENTS_MAX || g_pfe->hif_client[client->id])
+		return -EINVAL;
+
+	if (client->rx_qn < 0 || client->rx_qn > HIF_CLIENT_QUEUES_MAX ||
+	    client->tx_qn < 0 || client->tx_qn > HIF_CLIENT_QUEUES_MAX)
+		return -EINVAL;
+
+	if ((client->rx_qn && (client->rx_qsize <= 0 || !is_power_of_2(client->rx_qsize))) ||
+	    (client->tx_qn && (client->tx_qsize <= 0 || !is_power_of_2(client->tx_qsize))))
 		return -EINVAL;
 
 	hif_shm = client->pfe->hif.shm;
@@ -440,13 +449,8 @@ int hif_lib_xmit_pkt_sg(struct hif_client_s *client, unsigned int qno,
 		WRITE_ONCE(desc->ctrl, CL_DESC_OWN | CL_DESC_FLAGS(desc_flags));
 	}
 
-	if (dev)
-		netdev_sent_queue(dev, pkt_len);
-
 	rc = __hif_xmit_pkt_sg(hif, client->id, qno, segs, nr_descs);
 	if (unlikely(rc)) {
-		if (dev)
-			netdev_completed_queue(dev, 1, pkt_len);
 		for (i = 0; i < nr_descs; i++) {
 			unsigned int cur = (widx + i) & (queue->size - 1);
 
@@ -457,6 +461,9 @@ int hif_lib_xmit_pkt_sg(struct hif_client_s *client, unsigned int qno,
 		dma_unmap_single(hif->dev, segs[0].dma, segs[0].len, DMA_TO_DEVICE);
 		return rc;
 	}
+
+	if (dev)
+		netdev_sent_queue(dev, pkt_len);
 
 	queue->write_idx = (widx + nr_descs) & (queue->size - 1);
 	queue->tx_pending += nr_descs;

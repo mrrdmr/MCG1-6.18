@@ -15,22 +15,17 @@
  * without it, the kernel's own "disabling unused clocks" late-boot
  * step gates it off a couple seconds in, and every MDIO transaction
  * after that silently returns stale data instead of erroring (see
- * pfe_eth_probe_gem()).
+ * pfe_eth_probe_gem0()).
  *
  * Stage P8 adds the actual Tx/Rx path:
  *
  *  - pfe_eth_send_packet() (.ndo_start_xmit) submits via
- *    hif_lib_xmit_pkt() (Stage P8, pfe_hif_lib.c) -- one full,
- *    non-fragmented packet per call, no QoS classification (everything
- *    goes on a single fixed queue, PFE_ETH_TXQ). No stop/wake-queue flow
- *    control either: the 1024-deep ring (EMAC_TXQ_DEPTH) is comfortably
- *    more than this baseline's DHCP+ping target needs, so a full ring
- *    just drops the packet instead.
- *  - TSO/TSO6 is software GSO only (pfe_eth_send_packet() re-segments
- *    with skb_gso_segment() before calling pfe_eth_send_one() per
- *    resulting packet) -- the firmware's own hardware TSO submission
- *    path (struct hif_tso_hdr) exists but its exact wire semantics
- *    aren't confirmed, so it's not wired up yet.
+ *    hif_lib_xmit_pkt_sg() (Stage P8, pfe_hif_lib.c) with scatter-gather
+ *    support, BQL accounting, and stop/wake flow control
+ *    (PFE_TX_STOP_THRES / PFE_TX_WAKE_THRES).
+ *  - TSO/TSO6 is segmented by the Linux 6.18 network stack prior to
+ *    ndo_start_xmit() -- the firmware's own hardware TSO submission
+ *    path (struct hif_tso_hdr) isn't wired up yet.
  *  - pfe_eth_rx_drain() consumes what hif_lib_client_register() (Stage
  *    P7) made this GEM reachable for, called directly from
  *    pfe_eth_event_handler() -- itself called synchronously from
@@ -57,7 +52,9 @@
 #include <linux/etherdevice.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/mii.h>
+#include <linux/moduleparam.h>
 #include <linux/netdevice.h>
 #include <linux/of.h>
 #include <linux/of_mdio.h>
@@ -85,15 +82,11 @@ static struct net_device *pfe_gem0_netdev;
 
 static int pfe_mdio_wait_idle(void __iomem *emac_base)
 {
-	int timeout = EMAC_MDIO_TIMEOUT;
+	u32 val;
 
-	while (!(readl(emac_base + EMAC_NETWORK_STATUS) & EMAC_PHY_IDLE)) {
-		if (--timeout <= 0)
-			return -ETIMEDOUT;
-		udelay(10);
-	}
-
-	return 0;
+	return readl_poll_timeout(emac_base + EMAC_NETWORK_STATUS,
+				  val, val & EMAC_PHY_IDLE,
+				  10, EMAC_MDIO_TIMEOUT * 10);
 }
 
 static int pfe_eth_mdio_read(struct mii_bus *bus, int mii_id, int regnum)
@@ -385,10 +378,10 @@ static void pfe_eth_stop(struct pfe_eth_priv_s *priv)
 #define PFE_TX_WAKE_THRES	128U
 
 /*
- * Reap completed TX skbs, update BQL byte/packet accounting, and wake a
- * stopped netdev queue once available TX slots reach tx_wake_thres.
+ * Reap completed TX skbs and update BQL byte/packet accounting.
+ * Must be called with priv->tx_clean_lock held.
  */
-static void __pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
+static void __pfe_eth_reap_txq(struct pfe_eth_priv_s *priv, int qno, int count)
 {
 	struct net_device *dev = priv->dev;
 	int reap_max = max_t(int, count, PFE_ETH_TX_FREE_MAX);
@@ -396,6 +389,8 @@ static void __pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
 	unsigned int completed_bytes = 0;
 	struct sk_buff *skb;
 	unsigned int flags;
+
+	lockdep_assert_held(&priv->tx_clean_lock);
 
 	while (count-- > 0) {
 		skb = hif_lib_tx_get_next_complete(&priv->client, qno, &flags, reap_max);
@@ -411,6 +406,17 @@ static void __pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
 
 	if (completed_pkts)
 		netdev_completed_queue(dev, completed_pkts, completed_bytes);
+}
+
+/*
+ * Wake a stopped netdev queue once available TX slots reach tx_wake_thres.
+ * Must be called with priv->tx_clean_lock held.
+ */
+static void __pfe_eth_maybe_wake_txq(struct pfe_eth_priv_s *priv, int qno)
+{
+	struct net_device *dev = priv->dev;
+
+	lockdep_assert_held(&priv->tx_clean_lock);
 
 	if (unlikely(!priv->closing && netif_running(dev) && netif_queue_stopped(dev)) &&
 	    hif_lib_tx_avail(&priv->client, qno) >= priv->tx_wake_thres) {
@@ -419,6 +425,12 @@ static void __pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
 		priv->sw_stats.tx_queue_wakes++;
 		netif_wake_queue(dev);
 	}
+}
+
+static void __pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
+{
+	__pfe_eth_reap_txq(priv, qno, count);
+	__pfe_eth_maybe_wake_txq(priv, qno);
 }
 
 static void pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
@@ -511,30 +523,37 @@ static int pfe_eth_event_handler(void *data, int event, int qno)
 	return 0;
 }
 
-static void pfe_eth_maybe_stop_txq(struct pfe_eth_priv_s *priv, unsigned int stop_thres)
+static void __pfe_eth_stop_txq_locked(struct pfe_eth_priv_s *priv, unsigned int wake_thres)
 {
 	struct net_device *dev = priv->dev;
-	unsigned int wake_thres = max_t(unsigned int, PFE_TX_WAKE_THRES, stop_thres);
 
-	BUILD_BUG_ON(PFE_TX_STOP_THRES < PFE_TX_MAX_SG_DESCS);
-	BUILD_BUG_ON(PFE_TX_WAKE_THRES < PFE_TX_STOP_THRES);
+	lockdep_assert_held(&priv->tx_clean_lock);
 
-	spin_lock_bh(&priv->tx_clean_lock);
-
-	if (unlikely(priv->closing || !netif_running(dev))) {
-		spin_unlock_bh(&priv->tx_clean_lock);
+	if (unlikely(priv->closing || !netif_running(dev)))
 		return;
-	}
 
-	if (unlikely(hif_lib_tx_avail(&priv->client, PFE_ETH_TXQ) < stop_thres)) {
-		priv->tx_wake_thres = wake_thres;
+	priv->tx_wake_thres = wake_thres;
+	if (!netif_queue_stopped(dev)) {
 		netif_stop_queue(dev);
 		priv->sw_stats.tx_queue_stops++;
-		pfe_hif_request_tx_irq(&priv->pfe->hif, priv->client.id);
-		__pfe_eth_flush_txq(priv, PFE_ETH_TXQ, EMAC_TXQ_DEPTH);
 	}
+	pfe_hif_request_tx_irq(&priv->pfe->hif, priv->client.id);
+	__pfe_eth_reap_txq(priv, PFE_ETH_TXQ, EMAC_TXQ_DEPTH);
+	__pfe_eth_maybe_wake_txq(priv, PFE_ETH_TXQ);
+}
 
-	spin_unlock_bh(&priv->tx_clean_lock);
+static void __pfe_eth_tx_post_xmit(struct pfe_eth_priv_s *priv, int reap_count,
+				   unsigned int stop_thres, bool force_stop)
+{
+	unsigned int wake_thres = max_t(unsigned int, PFE_TX_WAKE_THRES, stop_thres);
+
+	lockdep_assert_held(&priv->tx_clean_lock);
+
+	__pfe_eth_reap_txq(priv, PFE_ETH_TXQ, reap_count);
+	if (force_stop || unlikely(hif_lib_tx_avail(&priv->client, PFE_ETH_TXQ) < stop_thres))
+		__pfe_eth_stop_txq_locked(priv, wake_thres);
+	else
+		__pfe_eth_maybe_wake_txq(priv, PFE_ETH_TXQ);
 }
 
 #define PHY_PORT_STRUCT_SIZE	16
@@ -631,7 +650,11 @@ err_register:
 static int pfe_eth_close(struct net_device *dev)
 {
 	struct pfe_eth_priv_s *priv = netdev_priv(dev);
+	struct hif_client_tx_queue *q = &priv->client.tx_q[PFE_ETH_TXQ];
 	int retries = 100;
+
+	BUILD_BUG_ON(PFE_TX_STOP_THRES < PFE_TX_MAX_SG_DESCS);
+	BUILD_BUG_ON(PFE_TX_WAKE_THRES < PFE_TX_STOP_THRES);
 
 	spin_lock_bh(&priv->tx_clean_lock);
 	priv->closing = true;
@@ -644,18 +667,16 @@ static int pfe_eth_close(struct net_device *dev)
 	if (priv->phydev)
 		pfe_phy_exit(dev);
 
-	while (priv->client.tx_q[PFE_ETH_TXQ].tx_pending && retries-- > 0) {
+	while (READ_ONCE(q->tx_pending) && retries-- > 0) {
 		pfe_eth_flush_txq(priv, PFE_ETH_TXQ, EMAC_TXQ_DEPTH);
-		if (!priv->client.tx_q[PFE_ETH_TXQ].tx_pending)
+		if (!READ_ONCE(q->tx_pending))
 			break;
-		udelay(100);
+		usleep_range(100, 200);
 	}
 
-	if (unlikely(priv->client.tx_q[PFE_ETH_TXQ].tx_pending)) {
-		struct hif_client_tx_queue *q = &priv->client.tx_q[PFE_ETH_TXQ];
-
+	if (unlikely(READ_ONCE(q->tx_pending))) {
 		netdev_warn(dev, "closing with %u pending TX descriptors\n",
-			    q->tx_pending);
+			    READ_ONCE(q->tx_pending));
 		spin_lock_bh(&priv->tx_clean_lock);
 		hif_tx_lock(&priv->pfe->hif);
 		pfe_hif_tx_orphan_client(&priv->pfe->hif, priv->client.id, q);
@@ -798,7 +819,10 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 		pfe_eth_unmap_frag_segs(dma_dev, frag_segs, nr_frag_segs);
 		if (rc == -EBUSY) {
 			priv->sw_stats.tx_busy_retries++;
-			pfe_eth_maybe_stop_txq(priv, PFE_TX_STOP_THRES);
+			spin_lock_bh(&priv->tx_clean_lock);
+			__pfe_eth_tx_post_xmit(priv, EMAC_TXQ_DEPTH,
+						PFE_TX_STOP_THRES, true);
+			spin_unlock_bh(&priv->tx_clean_lock);
 			return NETDEV_TX_BUSY;
 		}
 		dev_kfree_skb_any(skb);
@@ -813,9 +837,10 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 		priv->sw_stats.tx_sg_frags += nr_frag_segs;
 	}
 
-	pfe_eth_flush_txq(priv, PFE_ETH_TXQ,
-			  max_t(int, PFE_ETH_TX_FREE_MAX, (int)(1 + nr_frag_segs)));
-	pfe_eth_maybe_stop_txq(priv, PFE_TX_STOP_THRES);
+	spin_lock_bh(&priv->tx_clean_lock);
+	__pfe_eth_tx_post_xmit(priv, max_t(int, PFE_ETH_TX_FREE_MAX, (int)(1 + nr_frag_segs)),
+			       PFE_TX_STOP_THRES, false);
+	spin_unlock_bh(&priv->tx_clean_lock);
 
 	return NETDEV_TX_OK;
 }
@@ -933,7 +958,7 @@ static void pfe_eth_set_multi(struct net_device *dev)
 	for (slot = programmed_uc + 2; slot <= EMAC_SPEC_ADDR_MAX; slot++)
 		gemac_set_laddrN(priv->EMAC_baseaddr, &zero_addr, slot);
 
-	if (netdev_uc_count(dev) >= EMAC_SPEC_ADDR_MAX - 1)
+	if (netdev_uc_count(dev) > EMAC_SPEC_ADDR_MAX - 1)
 		gemac_enable_unicast(priv->EMAC_baseaddr);
 	else
 		gemac_disable_unicast(priv->EMAC_baseaddr);
@@ -1058,23 +1083,26 @@ static void pfe_eth_extphy_clk_release(void *data)
 	clk_put(clk);
 }
 
+static char pfe_boot_mac_param[18];
 static u8 pfe_boot_mac_addr[ETH_ALEN];
 static bool pfe_boot_mac_addr_valid;
 
-static int __init pfe_mac_addr_setup(char *str)
+static void pfe_parse_mac_param(void)
 {
-	char *tok;
+	char buf[sizeof(pfe_boot_mac_param)];
+	char *p = buf, *tok;
 
-	if (!str || !*str)
-		return 1;
+	if (!pfe_boot_mac_param[0])
+		return;
 
-	tok = strsep(&str, ",");
+	strscpy(buf, pfe_boot_mac_param, sizeof(buf));
+	tok = strsep(&p, ",");
 	if (tok && *tok && mac_pton(tok, pfe_boot_mac_addr))
 		pfe_boot_mac_addr_valid = true;
-
-	return 1;
 }
-__setup("mac_addr=", pfe_mac_addr_setup);
+
+module_param_string(mac_addr, pfe_boot_mac_param, sizeof(pfe_boot_mac_param), 0444);
+MODULE_PARM_DESC(mac_addr, "Initial MAC address for GEM0");
 
 static int pfe_eth_probe_gem0(struct pfe *pfe, struct device_node *np)
 {
@@ -1138,6 +1166,7 @@ static int pfe_eth_probe_gem0(struct pfe *pfe, struct device_node *np)
 	if (of_get_phy_mode(np, &priv->phy_mode))
 		priv->phy_mode = PHY_INTERFACE_MODE_MII;
 
+	pfe_parse_mac_param();
 	if (of_get_ethdev_address(np, dev)) {
 		if (pfe_boot_mac_addr_valid)
 			eth_hw_addr_set(dev, pfe_boot_mac_addr);

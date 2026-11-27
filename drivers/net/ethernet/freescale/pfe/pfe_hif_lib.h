@@ -8,8 +8,8 @@
  * (the shared-memory rx buffer pool, and the client event indication
  * used by the Rx path). Stage P7 added the client-registration API
  * (hif_lib_client_register()/unregister()) that pfe_eth.c calls from
- * its .ndo_open/.ndo_stop. Stage P8 adds the TX submission path
- * (hif_lib_xmit_pkt(), hif_lib_tx_get_next_complete()) and
+ * its .ndo_open/.ndo_stop. Stage P8 adds the SG TX submission path
+ * (hif_lib_xmit_pkt_sg(), hif_lib_tx_get_next_complete()) and
  * hif_lib_event_handler_start() (the Rx re-arm half of the
  * hif_lib_indicate_client() edge-triggered wakeup below). Still out of
  * scope: TSO and TX credit/QoS accounting -- neither is needed for
@@ -135,12 +135,11 @@ extern unsigned int pfe_pkt_headroom;
 /* Allocate a 2048-byte page fragment and return the packet data pointer
  * past PFE_PKT_HEADROOM, using the first headroom slot for RX DMA state.
  */
-static inline void *pfe_hif_buf_alloc(struct device *dev, gfp_t flags)
+static inline void *pfe_hif_buf_alloc(struct device *dev)
 {
 	void *base;
 
 	(void)dev;
-	(void)flags;
 
 	/* Second argument to netdev_alloc_frag_align() is the alignment
 	 * itself, which must be a power of two -- it is converted to the
