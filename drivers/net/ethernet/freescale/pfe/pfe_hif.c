@@ -120,6 +120,7 @@ static void pfe_hif_reset_tx_desc_sw(struct hif_desc_sw *desc_sw)
 	desc_sw->client_id = HIF_CLIENTS_MAX;
 	desc_sw->q_no = 0;
 	desc_sw->chain_id = 0;
+	desc_sw->chain_token = 0;
 	desc_sw->map_type = PFE_TX_MAP_NONE;
 }
 
@@ -258,9 +259,9 @@ static void pfe_hif_mark_client_orphaned(struct pfe_hif *hif, unsigned int clien
 /*
  * Prove that an entire orphaned SG packet chain starting at start_q_idx with
  * length chain_len is present in the active HIF TX window with a unique
- * non-zero chain_id and that every descriptor in the chain has completed HW
- * DMA (!(ctrl & BD_CTRL_DESC_EN)) with BD_CTRL_LIFM set only on the final
- * descriptor.
+ * non-zero chain_id and packet-unique chain_token, and that every descriptor
+ * in the chain has completed HW DMA (!(ctrl & BD_CTRL_DESC_EN)) with
+ * BD_CTRL_LIFM set only on the final descriptor.
  */
 static bool pfe_hif_orphan_chain_done(struct pfe_hif *hif,
 				      const struct hif_client_tx_queue *q,
@@ -278,15 +279,18 @@ static bool pfe_hif_orphan_chain_done(struct pfe_hif *hif,
 		unsigned int hw_idx = (hif->Txtoclean + i) & (hif->TxRingSize - 1);
 		struct hif_desc_sw *sw = &hif->tx_sw_queue[hw_idx];
 		u64 target_chain_id;
+		uintptr_t target_token;
 		unsigned int q_no, step;
 		bool valid_chain = true;
 
 		if (sw->client_id != HIF_CLIENTS_MAX ||
 		    !sw->chain_id ||
+		    !sw->chain_token ||
 		    sw->q_idx != start_q_idx)
 			continue;
 
 		target_chain_id = sw->chain_id;
+		target_token = sw->chain_token;
 		q_no = sw->q_no;
 
 		for (step = 0; step < chain_len; step++) {
@@ -299,6 +303,7 @@ static bool pfe_hif_orphan_chain_done(struct pfe_hif *hif,
 
 			if (c_sw->client_id != HIF_CLIENTS_MAX ||
 			    c_sw->chain_id != target_chain_id ||
+			    c_sw->chain_token != target_token ||
 			    c_sw->q_no != q_no ||
 			    c_sw->q_idx != exp_q_idx ||
 			    (c_ctrl & BD_CTRL_DESC_EN) ||
@@ -517,12 +522,15 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 }
 
 /*
- * Detach remaining TX descriptors and skbs from a closing client queue using
- * CL_DESC_OWN as the single owner flag:
- *  - Completed orphaned SG chains are drained and synchronized first.
- *  - For remaining pending client descriptors, if !(q_ctrl & CL_DESC_OWN) the
- *    client ring owns q_desc->data so it is freed once here; if CL_DESC_OWN
- *    is set, desc_sw owns the skb and will release it upon completion.
+ * Reconcile remaining client TX descriptors on a closing queue strictly at
+ * full packet-chain boundaries so hardware and client ring state never
+ * split an SG chain across phases:
+ *  - Completed orphaned chains are drained and synchronized first.
+ *  - Any remaining pending chain that still has CL_DESC_OWN set on any
+ *    segment remains owned by HIF/HW until NAPI completion drains it.
+ *  - Any pending chain with no CL_DESC_OWN segments is retired as a single
+ *    unit, freeing its skb once and advancing ack_idx, read_idx, and
+ *    tx_pending together.
  */
 void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 			      struct hif_client_tx_queue *q)
@@ -539,22 +547,63 @@ void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 	pfe_hif_drain_orphaned_tx(hif, q);
 
 	while (q->tx_pending) {
-		struct tx_queue_desc *q_desc = q->base + q->read_idx;
-		u32 q_ctrl = READ_ONCE(q_desc->ctrl);
-		struct sk_buff *client_skb = q_desc->data;
+		unsigned int chain_len = 0, step;
+		bool found_last = false, hw_owned = false;
+		struct sk_buff *chain_skb = NULL;
 
-		if (q_ctrl & CL_DESC_OWN)
+		if (q->ack_idx != q->read_idx)
 			break;
 
-		q_desc->data = NULL;
-		WRITE_ONCE(q_desc->ctrl, 0);
-		if (q->ack_idx == q->read_idx)
-			q->ack_idx = (q->ack_idx + 1) & mask;
-		q->read_idx = (q->read_idx + 1) & mask;
-		q->tx_pending--;
+		for (step = 0; step < q->tx_pending && step < PFE_TX_MAX_SG_DESCS; step++) {
+			unsigned int q_idx = (q->read_idx + step) & mask;
+			struct tx_queue_desc *q_desc = q->base + q_idx;
+			u32 q_ctrl = READ_ONCE(q_desc->ctrl);
+			u32 desc_flags = CL_DESC_GET_FLAGS(q_ctrl);
 
-		if (client_skb)
-			dev_kfree_skb_any(client_skb);
+			if (step == 0 && !(desc_flags & HIF_FIRST_BUFFER))
+				return;
+			if (step > 0 && (desc_flags & HIF_FIRST_BUFFER))
+				return;
+
+			if (q_ctrl & CL_DESC_OWN)
+				hw_owned = true;
+
+			if (q_desc->data) {
+				if (chain_skb && chain_skb != q_desc->data)
+					return;
+				chain_skb = q_desc->data;
+			}
+
+			if (desc_flags & HIF_LAST_BUFFER) {
+				if (!(desc_flags & HIF_DATA_VALID))
+					return;
+				chain_len = step + 1;
+				found_last = true;
+				break;
+			}
+
+			if (desc_flags & HIF_DATA_VALID)
+				return;
+		}
+
+		if (!found_last || !chain_len || hw_owned)
+			break;
+
+		for (step = 0; step < chain_len; step++) {
+			unsigned int q_idx = (q->read_idx + step) & mask;
+			struct tx_queue_desc *q_desc = q->base + q_idx;
+
+			q_desc->data = NULL;
+			smp_wmb();
+			WRITE_ONCE(q_desc->ctrl, 0);
+		}
+
+		q->ack_idx = (q->read_idx + chain_len) & mask;
+		q->read_idx = (q->read_idx + chain_len) & mask;
+		q->tx_pending -= chain_len;
+
+		if (chain_skb)
+			dev_kfree_skb_any(chain_skb);
 	}
 }
 
@@ -811,8 +860,8 @@ pkt_drop:
  * Validate client TX descriptor position and ownership before transferring
  * skb ownership from HIF (desc_sw->skb, CL_DESC_OWN set) to the client ring
  * (desc->data, CL_DESC_OWN clear). On validation failure, leaves client
- * descriptor state untouched and returns an error so the caller can release
- * the skb cleanly and advance ring reclamation.
+ * descriptor state untouched and returns an error while keeping desc_sw->skb
+ * intact for the caller to release once.
  */
 static int client_ack_txpacket(struct pfe_hif *hif, unsigned int client_id,
 			       unsigned int q_no, unsigned int q_idx,
@@ -895,7 +944,7 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 
 	while (tx_avl < hif->TxRingSize && count--) {
 		struct sk_buff *skb;
-		bool acked = false;
+		int ack_err = -EINVAL;
 
 		desc = hif->TxBase + ttc;
 		if (READ_ONCE(desc->ctrl) & BD_CTRL_DESC_EN)
@@ -906,20 +955,18 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 		desc_sw = &hif->tx_sw_queue[ttc];
 		skb = desc_sw->skb;
 
-		if (desc_sw->client_id < HIF_CLIENTS_MAX) {
-			int ack_err = client_ack_txpacket(hif, desc_sw->client_id,
+		if (desc_sw->client_id < HIF_CLIENTS_MAX)
+			ack_err = client_ack_txpacket(hif, desc_sw->client_id,
 							desc_sw->q_no, desc_sw->q_idx,
 							skb);
-			if (likely(!ack_err)) {
-				desc_sw->skb = NULL;
-				acked = true;
-			}
-		}
 
-		if (!acked) {
+		if (unlikely(ack_err)) {
 			desc_sw->skb = NULL;
-			if (unlikely(skb))
+			if (skb)
 				dev_kfree_skb_any(skb);
+		} else {
+			/* Ownership transferred to client ring (or no skb). */
+			desc_sw->skb = NULL;
 		}
 
 		pfe_hif_unmap_tx_desc(hif, desc_sw);
@@ -944,6 +991,7 @@ int __hif_xmit_pkt_sg(struct pfe_hif *hif, unsigned int client_id, unsigned int 
 	struct hif_desc *first_desc;
 	u32 first_ctrl = 0;
 	u64 chain_id;
+	uintptr_t chain_token = 0;
 	unsigned int start_idx, i;
 
 	if (unlikely(!nr_descs || nr_descs > hif->TxRingSize))
@@ -958,6 +1006,15 @@ int __hif_xmit_pkt_sg(struct pfe_hif *hif, unsigned int client_id, unsigned int 
 	chain_id = hif->tx_chain_seq++;
 	if (unlikely(!chain_id))
 		chain_id = hif->tx_chain_seq++;
+
+	for (i = 0; i < nr_descs; i++) {
+		if (segs[i].skb) {
+			chain_token = (uintptr_t)segs[i].skb;
+			break;
+		}
+	}
+	if (!chain_token)
+		chain_token = (uintptr_t)chain_id;
 
 	start_idx = hif->Txtosend;
 	first_desc = hif->TxBase + start_idx;
@@ -976,6 +1033,7 @@ int __hif_xmit_pkt_sg(struct pfe_hif *hif, unsigned int client_id, unsigned int 
 		desc_sw->client_id = client_id;
 		desc_sw->q_no = q_no;
 		desc_sw->chain_id = chain_id;
+		desc_sw->chain_token = chain_token;
 		desc_sw->map_type = segs[i].map_type;
 
 		desc->data = lower_32_bits(segs[i].dma);
