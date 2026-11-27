@@ -8,19 +8,19 @@
  * (the shared-memory rx buffer pool, and the client event indication
  * used by the Rx path). Stage P7 added the client-registration API
  * (hif_lib_client_register()/unregister()) that pfe_eth.c calls from
- * its .ndo_open/.ndo_stop. Stage P8 adds the TX submission path
- * (hif_lib_xmit_pkt(), hif_lib_tx_get_next_complete()) and
+ * its .ndo_open/.ndo_stop. Stage P8 adds the SG TX submission path
+ * (hif_lib_xmit_pkt_sg(), hif_lib_tx_get_next_complete()) and
  * hif_lib_event_handler_start() (the Rx re-arm half of the
  * hif_lib_indicate_client() edge-triggered wakeup below). Still out of
- * scope: TSO and TX credit/QoS accounting -- neither is needed for
- * plain, non-jumbo Ethernet traffic at the pace this baseline targets
- * (DHCP+ping), and dropping them avoids reintroducing the FCI-adjacent
- * machinery this whole port has deliberately left out since Stage P1.
+ * scope: hardware TSO and multi-queue TX credit/QoS accounting --
+ * dropping them avoids reintroducing the FCI-adjacent machinery this
+ * whole port has deliberately left out since Stage P1.
  */
 #ifndef _PFE_HIF_LIB_H_
 #define _PFE_HIF_LIB_H_
 
 #include <linux/dma-mapping.h>
+#include <linux/netdevice.h>
 
 #include "pfe_hif.h"
 
@@ -130,42 +130,7 @@ extern unsigned int pfe_pkt_size;
 extern unsigned int pfe_pkt_headroom;
 
 /*
- * Rx packet buffers need to be genuinely non-cacheable, not just
- * cacheable memory wrapped in dma_map_single()/dma_unmap_single(). The
- * 3.2.26 vendor driver gets this via kmalloc(GFP_DMA_NCNB), a custom
- * flag that draws from a boot-time-remapped, Device-type-mapped
- * (MT_MSP_NCNB, see the vendor's arch/arm/mm/mmu.c) physical zone --
- * confirmed present and active (CONFIG_COMCERTO_ZONE_DMA_NCNB=y) in the
- * config that produced a working Rx on real hardware, and confirmed
- * absent (plain kmalloc(GFP_KERNEL)) in this port, which is Rx-stuck-
- * at-0 on the same hardware/firmware/cable. Porting the custom zone
- * itself would mean patching arch/arm/mm's lowmem mapping setup, too
- * invasive for a fix scoped to one driver. dma_alloc_coherent() reaches
- * the same guarantee (ARM's implementation maps it uncached) through
- * the portable DMA API instead -- the same mechanism this driver
- * already uses for the HIF descriptor ring itself (pfe_hif.c), where
- * Tx has proven it works.
- *
- * dma_alloc_coherent() memory can't be handed to generic kfree() or to
- * build_skb() (whose teardown path is kfree()-based) -- it comes from
- * a different allocator and must be freed via dma_free_coherent() with
- * the same size/dma_addr it was allocated with. That's why Rx moved
- * off zero-copy build_skb() onto a copy into a normal skb (pfe_eth.c)
- * -- once a buffer is handed to the network stack it would otherwise be
- * kfree()'d somewhere down the line by code that has no idea it's
- * DMA-coherent memory. This matches the vendor driver's own design:
- * it never zero-copies out of its GFP_DMA_NCNB pool either (pfe_eth.c's
- * pfe_eth_rx_skb() does dev_alloc_skb()+memcpy()), for exactly this
- * reason.
- *
- * The dma_addr_t handed back by dma_alloc_coherent() is stashed in the
- * buffer's own headroom (comfortably larger than sizeof(dma_addr_t))
- * so it can travel alongside the plain "void *" pointer everywhere one
- * is already passed around, without threading a second value through
- * every call site.
- */
-/*
- * Zero-copy Rx (stage 2): buffers are ordinary cached page fragments
+ * Zero-copy Rx: buffers are ordinary cached page fragments
  * (netdev_alloc_frag_align(), 128-byte aligned so the metadata word at
  * base[0] and the DMA region at base + PFE_PKT_HEADROOM never share a
  * cache line) and go through the streaming DMA API: pfe_hif_buf_map()
@@ -177,17 +142,23 @@ extern unsigned int pfe_pkt_headroom;
  *
  * The dma_addr_t of the current mapping is stashed in the buffer's own
  * headroom so it travels alongside the plain "void *" pointer.
- *
- * The 3.2.26 vendor driver did the same thing on top of its uncached
- * GFP_DMA_NCNB pool (alloc_skb_header() around the buffer, no copy), and
- * also dma_map_single()s every Rx buffer (pfe_hif.c there).
  */
-#define PFE_BUF_ALIGN		128
+#define PFE_BUF_ALIGN		128U
 
-static inline void *pfe_hif_buf_alloc(struct device *dev, gfp_t flags)
+/* Allocate a 2048-byte page fragment and return the packet data pointer
+ * past PFE_PKT_HEADROOM, using the first headroom slot for RX DMA state.
+ */
+static inline void *pfe_hif_buf_alloc(struct device *dev)
 {
-	void *base = netdev_alloc_frag_align(PFE_BUF_SIZE, PFE_BUF_ALIGN);
+	void *base;
 
+	(void)dev;
+
+	/* Second argument to netdev_alloc_frag_align() is the alignment
+	 * itself, which must be a power of two -- it is converted to the
+	 * internal mask by the helper.
+	 */
+	base = netdev_alloc_frag_align(PFE_BUF_SIZE, PFE_BUF_ALIGN);
 	if (!base)
 		return NULL;
 
@@ -196,12 +167,18 @@ static inline void *pfe_hif_buf_alloc(struct device *dev, gfp_t flags)
 	return base + PFE_PKT_HEADROOM;
 }
 
+/* Release an RX buffer back to the page-fragment allocator. */
 static inline void pfe_hif_buf_free(struct device *dev, void *pkt)
 {
-	skb_free_frag(pkt - PFE_PKT_HEADROOM);
+	(void)dev;
+
+	if (likely(pkt))
+		skb_free_frag(pkt - PFE_PKT_HEADROOM);
 }
 
-/* Map the packet area for the HIF to write into; returns the bus address to post. */
+/* Map the packet area for the HIF to write into; store the bus address in
+ * the headroom slot so unmap/reuse helpers do not require a separate copy.
+ */
 static inline dma_addr_t pfe_hif_buf_map(struct device *dev, void *pkt)
 {
 	dma_addr_t dma = dma_map_single(dev, pkt, PFE_PKT_SIZE, DMA_FROM_DEVICE);
@@ -214,12 +191,13 @@ static inline dma_addr_t pfe_hif_buf_map(struct device *dev, void *pkt)
 	return dma;
 }
 
-/* Bus address of the current mapping (0 if unmapped). */
+/* Bus address of the current RX mapping (0 if unmapped). */
 static inline dma_addr_t pfe_hif_buf_dma(void *pkt)
 {
 	return *(dma_addr_t *)(pkt - PFE_PKT_HEADROOM);
 }
 
+/* Unmap the active RX DMA mapping and clear the stored headroom address. */
 static inline void pfe_hif_buf_unmap(struct device *dev, void *pkt)
 {
 	dma_addr_t *slot = pkt - PFE_PKT_HEADROOM;
@@ -231,41 +209,13 @@ static inline void pfe_hif_buf_unmap(struct device *dev, void *pkt)
 }
 
 /*
- * pfe_hif_buf_alloc()/_free() above are only safe to call from process
- * context (GFP_KERNEL) -- real-hardware testing (Rx working for the
- * first ~60 packets of live DHCP+ping traffic, then permanently
- * stalled on one HIF descriptor, followed minutes later by an
- * unrelated-looking kernel panic from ksoftirqd spinning at 100% CPU)
- * traced back to client_put_rxpacket() in pfe_hif.c calling
- * pfe_hif_buf_alloc(..., GFP_ATOMIC) on every single received packet,
- * to refill the HIF descriptor the packet just came out of. A GFP_ATOMIC
- * dma_alloc_coherent() can't sleep, so it's forced through the kernel's
- * small, fixed-size boot-time atomic DMA pool (a few hundred KB, shared
- * with every other atomic coherent-DMA user in the system) rather than
- * the much larger general-purpose backing pfe_hif_shm_init()'s
- * GFP_KERNEL calls can draw from -- once a modest burst of traffic
- * exhausts it, allocation starts permanently failing, the descriptor
- * it would have refilled never gets re-armed, and NAPI (which treats
- * "client queue full" as "budget exhausted, poll again immediately")
- * busy-spins forever trying to make progress on a descriptor that will
- * never move again. Confirmed by temporarily growing the pool via the
- * coherent_pool= boot argument, which fixed it -- but depending on a
- * boot argument to not exhaust a shared, kernel-wide pool is fragile
- * (and the vendor driver, which sources Rx buffers from its own
- * kmalloc(GFP_DMA_NCNB) zone -- a normal slab allocator, not a fixed
- * pool -- never had this problem or this bootarg to begin with).
- *
- * pfe_hif_spare_buf_get()/_put() below are the actual fix: a pool of
- * HIF_RX_DESC_NT spare buffers, pre-allocated once via GFP_KERNEL
- * (pfe_hif_lib_init(), process context, same as the ring's own initial
- * fill) and recycled from then on via plain array push/pop -- no
- * allocator call, atomic or otherwise, on the Rx hot path at all. Sized
- * at HIF_RX_DESC_NT because that's a comfortable upper bound on how
- * many buffers can be "in flight" between having just left the HIF ring
- * and having been freed back by pfe_eth_rx_drain() -- in the common
- * case that's at most one per packet (the drain is synchronous, called
- * from within the same hif->lock critical section client_put_rxpacket()
- * runs in), so this is generous headroom, not a tight budget.
+ * Pool of HIF_RX_DESC_NT spare buffers pre-allocated via GFP_KERNEL in
+ * pfe_hif_lib_init() and recycled via plain array push/pop, keeping page-
+ * fragment allocator calls off the hot RX path in the steady state (with
+ * pfe_hif_buf_alloc() fallback in client_put_rxpacket() if the spare
+ * pool ever drains). Sized at HIF_RX_DESC_NT because the drain runs
+ * synchronously inside the HIF NAPI poll, so at most a small number of
+ * buffers are in flight between HIF dequeue and build_skb().
  */
 void *pfe_hif_spare_buf_get(void);
 void pfe_hif_spare_buf_put(void *buf);
@@ -277,28 +227,24 @@ void hif_lib_indicate_client(int cl_id, int event, int data);
 /*
  * Client registration API (Stage P7) -- lets a net_device driver
  * (pfe_eth.c) hand the HIF driver its Rx/Tx shared-memory queues and
- * become reachable via hif_lib_indicate_client() above. The Tx
- * submission path itself (hif_lib_xmit_pkt() and friends) stays out of
- * scope until Stage P8 actually needs to send a packet.
+ * become reachable via hif_lib_indicate_client() above.
  */
 int hif_lib_client_register(struct hif_client_s *client);
 int hif_lib_client_unregister(struct hif_client_s *client);
 int hif_lib_tmu_queue_start(struct hif_client_s *client, int qno);
 int hif_lib_tmu_queue_stop(struct hif_client_s *client, int qno);
 
-/*
- * TX submission (Stage P8) -- hif_lib_xmit_pkt() queues one full,
- * non-fragmented packet (the only case this port implements; the
- * vendor's fragmented/TSO submission path via __hif_lib_xmit_pkt() and
- * multiple HIF_FIRST_BUFFER/HIF_LAST_BUFFER-flagged calls per packet
- * isn't ported). hif_lib_tx_get_next_complete() dequeues a completed
- * packet's client_data (the skb pointer the caller passed in) so the
- * caller can free it -- this is also how the underlying HIF Tx ring
- * descriptor's DMA mapping gets torn down, via hif_tx_done_process()
- * inside it (already ported in pfe_hif.c since Stage P5).
- */
-int hif_lib_xmit_pkt(struct hif_client_s *client, unsigned int qno, void *data,
-		      unsigned int len, u32 client_ctrl, void *client_data);
+#define PFE_TX_MAX_SG_DESCS	(MAX_SKB_FRAGS + 1)
+#define PFE_HIF_MAX_BD_LEN	0x3FFFU
+
+unsigned int hif_lib_tx_avail(struct hif_client_s *client, unsigned int qno);
+int hif_lib_xmit_pkt_sg(struct hif_client_s *client, unsigned int qno,
+			void *head_data, unsigned int head_len,
+			const struct pfe_tx_sg_seg *frag_segs,
+			unsigned int nr_frags, u32 client_ctrl,
+			void *client_data, struct net_device *dev,
+			unsigned int pkt_len);
+
 void *hif_lib_tx_get_next_complete(struct hif_client_s *client, int qno,
 				    unsigned int *flags, int count);
 

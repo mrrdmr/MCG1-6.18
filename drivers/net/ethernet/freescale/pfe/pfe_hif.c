@@ -28,32 +28,23 @@
  *    begin with. Dropped; flagged here in case real-hardware Rx
  *    corruption ever points back at it.
  *
- * Rx packet buffers (as opposed to the descriptor ring, always
- * dma_alloc_coherent()) were originally kmalloc()+dma_map_single()/
- * dma_unmap_single(), matching a mainline streaming-DMA driver. Real-
- * hardware testing (Rx stuck at 0 packets on this port, while a
- * reference 3.2.26 vendor kernel/pfe.ko built and run on the exact
- * same hardware received traffic normally) traced this to the vendor
- * driver relying on kmalloc(GFP_DMA_NCNB) for Rx buffers specifically
- * -- a custom flag drawing from a boot-time-remapped, genuinely
- * non-cacheable (Device-type) physical zone, confirmed active in the
- * working reference config. Rx buffers now come from dma_alloc_
- * coherent() instead (pfe_hif_buf_alloc()/_free()/_dma() in
- * pfe_hif_lib.h), which gets the same non-cacheable guarantee through
- * the portable DMA API -- the same mechanism this driver already uses
- * for the descriptor ring, where Tx has proven it works. See the
- * comment above those helpers for why this also meant moving Rx off
- * zero-copy build_skb() in pfe_eth.c.
- *
- * Deferred to Stage P7-P9 (pfe_eth.c, the only caller of any of these):
- * the client TX path (__hif_xmit_pkt() and hif_xmit_pkt() are ported
- * since they're small and self-contained, but nothing calls them yet).
+ * Rx packet buffers are allocated as 2048-byte page fragments via
+ * netdev_alloc_frag_align() (pfe_hif_buf_alloc()/_free()/_map()/
+ * _unmap() in pfe_hif_lib.h) and mapped with streaming DMA
+ * (dma_map_single(..., DMA_FROM_DEVICE)). Storing the bus address in
+ * the first slot of PFE_PKT_HEADROOM keeps DMA metadata on a separate
+ * cache line from the packet payload and allows zero-copy build_skb()
+ * delivery in pfe_eth.c.
  */
 
-#include <linux/interrupt.h>
+#include <linux/bitops.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/kernel.h>
+#include <linux/lockdep.h>
+#include <linux/skbuff.h>
 #include <linux/string.h>
 
 #include "pfe_mod.h"
@@ -61,6 +52,9 @@
 #include "pfe_hif_lib.h"
 #include "pfe_hw_lib.h"
 
+#ifndef HIF_TXPKT_INT
+#define HIF_TXPKT_INT		(1 << 4)
+#endif
 #define HIF_INT_MASK		(HIF_INT | HIF_RXPKT_INT)
 #define TX_FREE_MAX_COUNT	64
 
@@ -86,31 +80,34 @@ static int pfe_hif_alloc_descr(struct pfe_hif *hif)
 	hif->RxRingSize = HIF_RX_DESC_NT;
 	hif->TxRingSize = HIF_TX_DESC_NT;
 
-	addr = dma_alloc_coherent(hif->dev, HIF_TX_DESC_NT * sizeof(struct hif_tso_hdr),
-				   &dma_addr, GFP_KERNEL);
-	if (!addr) {
-		dev_err(hif->dev, "%s: could not allocate per-packet tx header\n", __func__);
-		dma_free_coherent(hif->dev,
-				   hif->RxRingSize * sizeof(struct hif_desc) +
-				   hif->TxRingSize * sizeof(struct hif_desc),
-				   hif->descr_baseaddr_v, hif->descr_baseaddr_p);
-		return -ENOMEM;
-	}
-
-	hif->tso_hdr_p = dma_addr;
-	hif->tso_hdr_v = addr;
-
 	return 0;
 }
 
 static void pfe_hif_free_descr(struct pfe_hif *hif)
 {
-	dma_free_coherent(hif->dev, hif->TxRingSize * sizeof(struct hif_tso_hdr),
-			   hif->tso_hdr_v, hif->tso_hdr_p);
-	dma_free_coherent(hif->dev,
-			   hif->RxRingSize * sizeof(struct hif_desc) +
-			   hif->TxRingSize * sizeof(struct hif_desc),
-			   hif->descr_baseaddr_v, hif->descr_baseaddr_p);
+	if (hif->descr_baseaddr_v) {
+		dma_free_coherent(hif->dev,
+				   hif->RxRingSize * sizeof(struct hif_desc) +
+				   hif->TxRingSize * sizeof(struct hif_desc),
+				   hif->descr_baseaddr_v, hif->descr_baseaddr_p);
+		hif->descr_baseaddr_v = NULL;
+		hif->descr_baseaddr_p = 0;
+	}
+}
+
+static void pfe_hif_unmap_tx_desc(struct pfe_hif *hif, struct hif_desc_sw *desc_sw)
+{
+	if (!desc_sw->data)
+		return;
+
+	if (desc_sw->map_type == PFE_TX_MAP_PAGE)
+		dma_unmap_page(hif->dev, desc_sw->data, desc_sw->len, DMA_TO_DEVICE);
+	else if (desc_sw->map_type == PFE_TX_MAP_SINGLE)
+		dma_unmap_single(hif->dev, desc_sw->data, desc_sw->len, DMA_TO_DEVICE);
+
+	desc_sw->data = 0;
+	desc_sw->len = 0;
+	desc_sw->map_type = PFE_TX_MAP_NONE;
 }
 
 static void pfe_hif_release_buffers(struct pfe_hif *hif)
@@ -118,20 +115,41 @@ static void pfe_hif_release_buffers(struct pfe_hif *hif)
 	struct hif_desc *desc = hif->RxBase;
 	int i;
 
-	for (i = 0; i < hif->RxRingSize; i++) {
-		if (desc->data) {
-			if (i < hif->shm->rx_buf_pool_cnt && !hif->shm->rx_buf_pool[i]) {
+	if (desc) {
+		for (i = 0; i < hif->RxRingSize; i++) {
+			if (hif->rx_buf_addr[i]) {
 				pfe_hif_buf_unmap(hif->dev, hif->rx_buf_addr[i]);
-				hif->shm->rx_buf_pool[i] = hif->rx_buf_addr[i];
-			} else {
-				dev_err(hif->dev, "%s: buffer pool already full\n", __func__);
+				if (i < hif->shm->rx_buf_pool_cnt && !hif->shm->rx_buf_pool[i]) {
+					hif->shm->rx_buf_pool[i] = hif->rx_buf_addr[i];
+				} else {
+					dev_err(hif->dev, "%s: buffer pool already full\n", __func__);
+					pfe_hif_buf_free(hif->dev, hif->rx_buf_addr[i]);
+				}
+				hif->rx_buf_addr[i] = NULL;
 			}
-		}
 
-		desc->data = 0;
-		desc->status = 0;
-		desc->ctrl = 0;
-		desc++;
+			desc->data = 0;
+			desc->status = 0;
+			desc->ctrl = 0;
+			desc++;
+		}
+	}
+
+	if (hif->TxBase) {
+		desc = hif->TxBase;
+		for (i = 0; i < hif->TxRingSize; i++) {
+			struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[i];
+
+			pfe_hif_unmap_tx_desc(hif, desc_sw);
+			if (unlikely(desc_sw->orphaned_skb)) {
+				dev_kfree_skb_any(desc_sw->orphaned_skb);
+				desc_sw->orphaned_skb = NULL;
+			}
+			desc->data = 0;
+			desc->status = 0;
+			desc->ctrl = 0;
+			desc++;
+		}
 	}
 }
 
@@ -141,8 +159,8 @@ static void pfe_hif_release_buffers(struct pfe_hif *hif)
  */
 static int pfe_hif_init_buffers(struct pfe_hif *hif)
 {
-	struct hif_desc *desc, *first_desc_p;
-	dma_addr_t data;
+	struct hif_desc *desc;
+	dma_addr_t data, first_desc_p, tx_base_p;
 	int i;
 
 	if (hif->shm->rx_buf_pool_cnt < hif->RxRingSize)
@@ -152,48 +170,54 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 	memset(hif->RxBase, 0, hif->RxRingSize * sizeof(struct hif_desc));
 
 	desc = hif->RxBase;
-	first_desc_p = (struct hif_desc *)hif->descr_baseaddr_p;
+	first_desc_p = hif->descr_baseaddr_p;
 
 	for (i = 0; i < hif->RxRingSize; i++) {
+		u32 next_idx = (i + 1) & (hif->RxRingSize - 1);
+
 		data = pfe_hif_buf_map(hif->dev, (void *)hif->shm->rx_buf_pool[i]);
-		if (!data)
+		if (!data) {
+			while (i-- > 0) {
+				pfe_hif_buf_unmap(hif->dev, hif->rx_buf_addr[i]);
+				hif->shm->rx_buf_pool[i] = hif->rx_buf_addr[i];
+				hif->rx_buf_addr[i] = NULL;
+			}
 			return -ENOMEM;
+		}
 		hif->rx_buf_addr[i] = (void *)hif->shm->rx_buf_pool[i];
 		hif->shm->rx_buf_pool[i] = NULL;
 
-		desc->data = data;
-
+		desc->data = lower_32_bits(data);
 		desc->status = 0;
+		desc->next = lower_32_bits(first_desc_p + next_idx * sizeof(struct hif_desc));
 		wmb();
 		desc->ctrl = BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM | BD_CTRL_DIR |
 			     BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size);
-		desc->next = (u32)(first_desc_p + i + 1);
 		desc++;
 	}
-	desc--;
-	desc->next = (u32)first_desc_p;
 
 	hif->RxtocleanIndex = 0;
 
-	writel(hif->descr_baseaddr_p, HIF_RX_BDP_ADDR);
+	writel(lower_32_bits(first_desc_p), HIF_RX_BDP_ADDR);
 
 	hif->TxBase = hif->RxBase + hif->RxRingSize;
-	first_desc_p = (struct hif_desc *)hif->descr_baseaddr_p + hif->RxRingSize;
+	tx_base_p = first_desc_p + hif->RxRingSize * sizeof(struct hif_desc);
 	memset(hif->TxBase, 0, hif->TxRingSize * sizeof(struct hif_desc));
+	memset(hif->tx_sw_queue, 0, sizeof(hif->tx_sw_queue));
 
 	desc = hif->TxBase;
 	for (i = 0; i < hif->TxRingSize; i++) {
-		desc->next = (u32)(first_desc_p + i + 1);
+		u32 next_idx = (i + 1) & (hif->TxRingSize - 1);
+
+		desc->next = lower_32_bits(tx_base_p + next_idx * sizeof(struct hif_desc));
 		desc++;
 	}
-	desc--;
-	desc->next = (u32)first_desc_p;
 
 	hif->TxAvail = hif->TxRingSize;
 	hif->Txtosend = 0;
 	hif->Txtoclean = 0;
 
-	writel((u32)first_desc_p, HIF_TX_BDP_ADDR);
+	writel(lower_32_bits(tx_base_p), HIF_TX_BDP_ADDR);
 
 	return 0;
 }
@@ -220,7 +244,7 @@ static int pfe_hif_client_register(struct pfe_hif *hif, u32 client_id,
 
 	cnt = min_t(u32, CLIENT_CTRL_RX_Q_CNT(client_shm->ctrl), HIF_CLIENT_QUEUES_MAX);
 	client->rx_qn = cnt;
-	rx_qbase = (struct rx_queue_desc *)client_shm->rx_qbase;
+	rx_qbase = (struct rx_queue_desc *)(uintptr_t)client_shm->rx_qbase;
 	for (i = 0; i < cnt; i++) {
 		client->rx_q[i].base = rx_qbase + i * client_shm->rx_qsize;
 		client->rx_q[i].size = client_shm->rx_qsize;
@@ -229,7 +253,7 @@ static int pfe_hif_client_register(struct pfe_hif *hif, u32 client_id,
 
 	cnt = min_t(u32, CLIENT_CTRL_TX_Q_CNT(client_shm->ctrl), HIF_CLIENT_QUEUES_MAX);
 	client->tx_qn = cnt;
-	tx_qbase = (struct tx_queue_desc *)client_shm->tx_qbase;
+	tx_qbase = (struct tx_queue_desc *)(uintptr_t)client_shm->tx_qbase;
 	for (i = 0; i < cnt; i++) {
 		client->tx_q[i].base = tx_qbase + i * client_shm->tx_qsize;
 		client->tx_q[i].size = client_shm->tx_qsize;
@@ -246,6 +270,8 @@ static int pfe_hif_client_register(struct pfe_hif *hif, u32 client_id,
 
 static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 {
+	unsigned int active, i;
+
 	spin_lock_bh(&hif->lock);
 	spin_lock_bh(&hif->tx_lock);
 
@@ -253,45 +279,115 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 		dev_err(hif->dev, "%s: client %d not registered\n", __func__, client_id);
 	} else {
 		hif->shm->gClient_status &= ~(1 << client_id);
+		memset(&hif->client[client_id], 0, sizeof(hif->client[client_id]));
+
+		/*
+		 * Orphan any in-flight Tx descriptors belonging to this client
+		 * so late completions still unmap DMA buffers without touching
+		 * a future session's tx_q.
+		 */
+		active = hif->TxRingSize - hif->TxAvail;
+		for (i = 0; i < active; i++) {
+			unsigned int cur = (hif->Txtoclean + i) & (hif->TxRingSize - 1);
+
+			if (hif->tx_sw_queue[cur].client_id == client_id)
+				hif->tx_sw_queue[cur].client_id = HIF_CLIENTS_MAX;
+		}
 	}
 
 	spin_unlock_bh(&hif->tx_lock);
 	spin_unlock_bh(&hif->lock);
+
+	pfe_hif_release_tx_irq(hif, client_id);
+}
+
+/*
+ * Detach remaining in-flight TX descriptors and skbs from a closing client
+ * queue so late TX completions release DMA/skb resources safely without
+ * referencing a reopened client session. Must be called with hif->tx_lock held.
+ */
+void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
+			      struct hif_client_tx_queue *q)
+{
+	unsigned int active, idx, i = 0;
+
+	lockdep_assert_held(&hif->tx_lock);
+
+	if (unlikely(!q || !q->base))
+		return;
+
+	active = hif->TxRingSize - hif->TxAvail;
+	idx = hif->Txtoclean;
+
+	while (q->tx_pending) {
+		struct tx_queue_desc *q_desc = q->base + q->read_idx;
+		struct sk_buff *skb = q_desc->data;
+		u32 q_ctrl = READ_ONCE(q_desc->ctrl);
+		bool has_skb = skb && (CL_DESC_GET_FLAGS(q_ctrl) & HIF_DATA_VALID);
+		bool attached = false;
+
+		if (q_ctrl & CL_DESC_OWN) {
+			while (i < active) {
+				unsigned int cur = (idx + i) & (hif->TxRingSize - 1);
+				struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[cur];
+
+				i++;
+				if (desc_sw->client_id != client_id)
+					continue;
+
+				desc_sw->client_id = HIF_CLIENTS_MAX;
+				if (has_skb) {
+					desc_sw->orphaned_skb = skb;
+					attached = true;
+				}
+				break;
+			}
+		}
+
+		if (has_skb && !attached)
+			dev_kfree_skb_any(skb);
+
+		q_desc->data = NULL;
+		WRITE_ONCE(q_desc->ctrl, 0);
+		q->read_idx = (q->read_idx + 1) & (q->size - 1);
+		q->tx_pending--;
+	}
+
+	for (; i < active; i++) {
+		unsigned int cur = (idx + i) & (hif->TxRingSize - 1);
+
+		if (hif->tx_sw_queue[cur].client_id == client_id)
+			hif->tx_sw_queue[cur].client_id = HIF_CLIENTS_MAX;
+	}
 }
 
 /*
  * Puts the Rx packet in the given client's Rx queue, swapping in a
  * freshly allocated buffer and returning the one that came out (which
- * the caller then re-posts into the HIF descriptor). Returns NULL if
- * the client's Rx queue is full.
+ * the caller then re-posts into the HIF descriptor). Sets *queue_full
+ * when the client's Rx queue has no free slot; returns NULL on either
+ * queue-full or allocation/DMA-mapping failure.
  */
 static void *client_put_rxpacket(struct pfe_hif *hif, void *pkt, u32 len, u32 flags,
-				  u32 client_ctrl)
+				  u32 client_ctrl, bool *queue_full)
 {
 	struct hif_rx_queue *queue = &hif->client[hif->client_id].rx_q[hif->qno];
 	struct rx_queue_desc *desc = queue->base + queue->write_idx;
 	void *free_pkt = NULL;
 
-	if (!(desc->ctrl & CL_DESC_OWN))
-		return NULL;
+	*queue_full = false;
 
-	/*
-	 * Not pfe_hif_buf_alloc(GFP_ATOMIC): see the comment above
-	 * pfe_hif_spare_buf_get() in pfe_hif_lib.h for why a fresh
-	 * dma_alloc_coherent() call on every packet is the wrong thing to
-	 * do here.
-	 */
+	if (!(READ_ONCE(desc->ctrl) & CL_DESC_OWN)) {
+		*queue_full = true;
+		return NULL;
+	}
+
 	free_pkt = pfe_hif_spare_buf_get();
 	if (!free_pkt)
-		free_pkt = pfe_hif_buf_alloc(hif->dev, GFP_ATOMIC);
+		free_pkt = pfe_hif_buf_alloc(hif->dev);
 	if (!free_pkt)
 		return NULL;
 
-	/*
-	 * Map the replacement before the hand-off: a mapping failure is
-	 * then reported like a full client queue, the HIF descriptor is
-	 * left untouched and retried on the next poll.
-	 */
 	if (!pfe_hif_buf_map(hif->dev, free_pkt)) {
 		pfe_hif_spare_buf_put(free_pkt);
 		return NULL;
@@ -300,7 +396,7 @@ static void *client_put_rxpacket(struct pfe_hif *hif, void *pkt, u32 len, u32 fl
 	desc->data = pkt;
 	desc->client_ctrl = client_ctrl;
 	smp_wmb();
-	desc->ctrl = CL_DESC_BUF_LEN(len) | flags;
+	WRITE_ONCE(desc->ctrl, CL_DESC_BUF_LEN(len) | flags);
 	queue->write_idx = (queue->write_idx + 1) & (queue->size - 1);
 
 	return free_pkt;
@@ -316,8 +412,10 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 	void *pkt_hdr_ptr;
 	void *free_buf;
 	int rtc, len, rx_processed = 0;
-	struct __hif_desc local_desc;
+	bool retried_full = false;
+	bool drop_pkt = false;
 	struct hif_desc *desc;
+	u32 ctrl;
 	int flags;
 
 	spin_lock_bh(&hif->lock);
@@ -325,19 +423,22 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 	rtc = hif->RxtocleanIndex;
 
 	while (rx_processed < budget) {
+		bool queue_full;
+
 		desc = hif->RxBase + rtc;
 
-		memcpy(&local_desc, desc, sizeof(local_desc));
-		if (local_desc.ctrl & BD_CTRL_DESC_EN) {
+		ctrl = READ_ONCE(desc->ctrl);
+		if (ctrl & BD_CTRL_DESC_EN) {
 			writel(HIF_INT_MASK, HIF_INT_SRC);
-			memcpy(&local_desc, desc, sizeof(local_desc));
-			if (local_desc.ctrl & BD_CTRL_DESC_EN)
+			ctrl = READ_ONCE(desc->ctrl);
+			if (ctrl & BD_CTRL_DESC_EN)
 				break;
 		}
 
-		hif->napi_counters[NAPI_DESC_COUNT]++;
+		/* Ensure DMA writes to packet buffer complete before reading it. */
+		dma_rmb();
 
-		len = BD_BUF_LEN(local_desc.ctrl);
+		len = BD_BUF_LEN(ctrl);
 
 		pkt_hdr_ptr = hif->rx_buf_addr[rtc];
 		pfe_hif_buf_unmap(hif->dev, pkt_hdr_ptr);
@@ -354,13 +455,26 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 			flags = 0;
 		}
 
-		if (local_desc.ctrl & BD_CTRL_LIFM)
+		if (ctrl & BD_CTRL_LIFM)
 			flags |= CL_DESC_LAST;
+
+		if (drop_pkt) {
+			if (ctrl & BD_CTRL_LIFM) {
+				drop_pkt = false;
+				hif->started = 0;
+			}
+			free_buf = pkt_hdr_ptr;
+			goto pkt_drop;
+		}
 
 		if (hif->client_id >= HIF_CLIENTS_MAX ||
 		    !(hif->shm->gClient_status & (1 << hif->client_id))) {
 			dev_err(hif->dev, "%s: packet with invalid client id %d qNo %d\n",
 				__func__, hif->client_id, hif->qno);
+			if (ctrl & BD_CTRL_LIFM)
+				hif->started = 0;
+			else
+				drop_pkt = true;
 			free_buf = pkt_hdr_ptr;
 			goto pkt_drop;
 		}
@@ -371,24 +485,46 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 			hif->qno = 0;
 		}
 
-		free_buf = client_put_rxpacket(hif, pkt_hdr_ptr, len, flags, hif->client_ctrl);
-
-		hif_lib_indicate_client(hif->client_id, EVENT_RX_PKT_IND, hif->qno);
-
+		free_buf = client_put_rxpacket(hif, pkt_hdr_ptr, len, flags,
+					       hif->client_ctrl, &queue_full);
 		if (unlikely(!free_buf)) {
-			hif->napi_counters[NAPI_CLIENT_FULL_COUNT]++;
+			if (queue_full && !retried_full) {
+				unsigned int ind_client = hif->client_id;
+				unsigned int ind_qno = hif->qno;
+
+				if (flags & CL_DESC_FIRST)
+					hif->started = 0;
+
+				retried_full = true;
+				hif->napi_counters[NAPI_CLIENT_FULL_COUNT]++;
+				hif->RxtocleanIndex = rtc;
+				spin_unlock_bh(&hif->lock);
+
+				hif_lib_indicate_client(ind_client, EVENT_RX_PKT_IND, ind_qno);
+
+				spin_lock_bh(&hif->lock);
+				rtc = hif->RxtocleanIndex;
+				continue;
+			}
+
 			/*
-			 * Tell NAPI we consumed the full budget so it keeps
-			 * polling us instead of a livelock where this
-			 * instance stays at the head of the list forever.
+			 * Either client Rx queue is still full after an event
+			 * indication or buffer allocation/DMA mapping failed:
+			 * recycle the current buffer back to the HIF Rx ring so
+			 * HIF_RXPKT_INT cannot storm.
 			 */
-			rx_processed = budget;
 			if (flags & CL_DESC_FIRST)
 				hif->started = 0;
-			break;
+			if (!(ctrl & BD_CTRL_LIFM))
+				drop_pkt = true;
+			free_buf = pkt_hdr_ptr;
+			goto pkt_drop;
 		}
 
+		retried_full = false;
+
 pkt_drop:
+		hif->napi_counters[NAPI_DESC_COUNT]++;
 		hif->rx_buf_addr[rtc] = free_buf;
 		/* The drop path re-posts the (now unmapped) buffer itself. */
 		if (!pfe_hif_buf_dma(free_buf) && !pfe_hif_buf_map(hif->dev, free_buf)) {
@@ -397,7 +533,7 @@ pkt_drop:
 			wmb();
 			desc->ctrl = 0;	/* leave it disabled rather than DMA to 0 */
 		} else {
-			desc->data = pfe_hif_buf_dma(free_buf);
+			desc->data = lower_32_bits(pfe_hif_buf_dma(free_buf));
 			wmb();
 			desc->ctrl = BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM | BD_CTRL_DIR |
 				     BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size);
@@ -405,12 +541,20 @@ pkt_drop:
 
 		inc_hif_rxidx(rtc);
 
-		if (local_desc.ctrl & BD_CTRL_LIFM) {
+		if (ctrl & BD_CTRL_LIFM) {
+			unsigned int ind_client = hif->client_id;
+			unsigned int ind_qno = hif->qno;
+
 			if (!(hif->client_ctrl & HIF_CTRL_RX_CONTINUED)) {
 				rx_processed++;
 				hif->napi_counters[NAPI_PACKET_COUNT]++;
 			}
 			hif->started = 0;
+			hif->RxtocleanIndex = rtc;
+
+			spin_unlock_bh(&hif->lock);
+			hif_lib_indicate_client(ind_client, EVENT_RX_PKT_IND, ind_qno);
+			spin_lock_bh(&hif->lock);
 		}
 	}
 
@@ -425,17 +569,30 @@ pkt_drop:
 
 static int client_ack_txpacket(struct pfe_hif *hif, unsigned int client_id, unsigned int q_no)
 {
-	struct hif_tx_queue *queue = &hif->client[client_id].tx_q[q_no];
-	struct tx_queue_desc *desc = queue->base + queue->ack_idx;
+	struct hif_tx_queue *queue;
+	struct tx_queue_desc *desc;
+	u32 q_ctrl;
 
-	if (!(desc->ctrl & CL_DESC_OWN)) {
+	if (unlikely(client_id >= HIF_CLIENTS_MAX ||
+		     !(hif->shm->gClient_status & (1 << client_id)) ||
+		     q_no >= hif->client[client_id].tx_qn))
+		return 0;
+
+	queue = &hif->client[client_id].tx_q[q_no];
+	if (unlikely(!queue->base))
+		return 0;
+
+	desc = queue->base + queue->ack_idx;
+	q_ctrl = READ_ONCE(desc->ctrl);
+
+	if (!(q_ctrl & CL_DESC_OWN)) {
 		dev_err(hif->dev, "%s: unexpected: %d %d %d %d %d %p %d\n", __func__,
 			hif->Txtosend, hif->Txtoclean, hif->TxAvail, client_id, q_no,
 			queue, queue->ack_idx);
 		return -EINVAL;
 	}
 
-	desc->ctrl &= ~CL_DESC_OWN;
+	WRITE_ONCE(desc->ctrl, q_ctrl & ~CL_DESC_OWN);
 	queue->ack_idx = (queue->ack_idx + 1) & (queue->size - 1);
 
 	return 0;
@@ -452,12 +609,17 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 
 	while (tx_avl < hif->TxRingSize && count--) {
 		desc = hif->TxBase + ttc;
-		if (desc->ctrl & BD_CTRL_DESC_EN)
+		if (READ_ONCE(desc->ctrl) & BD_CTRL_DESC_EN)
 			break;
 
+		dma_rmb();
+
 		desc_sw = &hif->tx_sw_queue[ttc];
-		if (desc_sw->data)
-			dma_unmap_single(hif->dev, desc_sw->data, desc_sw->len, DMA_TO_DEVICE);
+		pfe_hif_unmap_tx_desc(hif, desc_sw);
+		if (unlikely(desc_sw->orphaned_skb)) {
+			dev_kfree_skb_any(desc_sw->orphaned_skb);
+			desc_sw->orphaned_skb = NULL;
+		}
 
 		client_ack_txpacket(hif, desc_sw->client_id, desc_sw->q_no);
 
@@ -469,65 +631,114 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 	hif->TxAvail = tx_avl;
 }
 
-/* Puts one packet in the HIF Tx ring. Not yet called by anything --
- * kept here (rather than in Stage P7-P9) because it's small,
- * self-contained, and belongs with the rest of the Tx ring management
- * in this file.
+/*
+ * Program a scatter-gather descriptor chain into the HIF TX ring and start
+ * TX DMA; opportunistically reclaim completed descriptors if ring room drops
+ * below half.
  */
-void __hif_xmit_pkt(struct pfe_hif *hif, unsigned int client_id, unsigned int q_no,
-		     void *data, u32 len, unsigned int flags)
+int __hif_xmit_pkt_sg(struct pfe_hif *hif, unsigned int client_id, unsigned int q_no,
+		      const struct pfe_tx_sg_seg *segs, unsigned int nr_descs)
 {
-	struct hif_desc *desc = hif->TxBase + hif->Txtosend;
-	struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[hif->Txtosend];
+	struct hif_desc *first_desc;
+	u32 first_ctrl = 0;
+	unsigned int start_idx, i;
 
-	desc_sw->len = len;
-	desc_sw->client_id = client_id;
-	desc_sw->q_no = q_no;
+	if (unlikely(!nr_descs || nr_descs > hif->TxRingSize))
+		return -EINVAL;
 
-	if (flags & HIF_DONT_DMA_MAP) {
-		desc_sw->data = 0;
-		desc->data = (u32)data;
-	} else {
-		desc_sw->data = dma_map_single(hif->dev, data, len, DMA_TO_DEVICE);
-		desc->data = (u32)desc_sw->data;
+	if (unlikely(hif->TxAvail < nr_descs)) {
+		__hif_tx_done_process(hif, TX_FREE_MAX_COUNT);
+		if (hif->TxAvail < nr_descs)
+			return -EBUSY;
+	}
+
+	start_idx = hif->Txtosend;
+	first_desc = hif->TxBase + start_idx;
+
+	for (i = 0; i < nr_descs; i++) {
+		unsigned int cur = (start_idx + i) & (hif->TxRingSize - 1);
+		struct hif_desc *desc = hif->TxBase + cur;
+		struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[cur];
+		bool is_last = (i == nr_descs - 1);
+		u32 ctrl = BD_BUF_LEN(segs[i].len);
+
+		desc_sw->data = segs[i].dma;
+		desc_sw->orphaned_skb = NULL;
+		desc_sw->len = segs[i].len;
+		desc_sw->client_id = client_id;
+		desc_sw->q_no = q_no;
+		desc_sw->map_type = segs[i].map_type;
+
+		desc->data = lower_32_bits(segs[i].dma);
+		desc->status = 0;
+
+		if (is_last) {
+			if (client_id != PFE_CL_VWD)
+				ctrl |= BD_CTRL_LIFM | BD_CTRL_BRFETCH_DISABLE |
+					BD_CTRL_RTFETCH_DISABLE | BD_CTRL_PARSE_DISABLE |
+					BD_CTRL_PKT_INT_EN | BD_CTRL_DESC_EN;
+			else
+				ctrl |= BD_CTRL_LIFM | BD_CTRL_PKT_INT_EN | BD_CTRL_DESC_EN;
+		} else {
+			ctrl |= BD_CTRL_DESC_EN;
+		}
+
+		if (i == 0)
+			first_ctrl = ctrl;
+		else
+			desc->ctrl = ctrl;
 	}
 
 	wmb();
+	first_desc->ctrl = first_ctrl;
 
-	if (flags & HIF_LAST_BUFFER) {
-		if (client_id != PFE_CL_VWD)
-			desc->ctrl = BD_CTRL_LIFM | BD_CTRL_BRFETCH_DISABLE |
-				     BD_CTRL_RTFETCH_DISABLE | BD_CTRL_PARSE_DISABLE |
-				     BD_CTRL_DESC_EN | BD_BUF_LEN(len);
-		else
-			desc->ctrl = BD_CTRL_LIFM | BD_CTRL_DESC_EN | BD_BUF_LEN(len);
-	} else {
-		desc->ctrl = BD_CTRL_DESC_EN | BD_BUF_LEN(len);
-	}
+	hif->Txtosend = (start_idx + nr_descs) & (hif->TxRingSize - 1);
+	hif->TxAvail -= nr_descs;
 
-	inc_hif_txidx(hif->Txtosend);
-	hif->TxAvail--;
-}
+	hif_tx_dma_start();
 
-int hif_xmit_pkt(struct pfe_hif *hif, unsigned int client_id, unsigned int q_no,
-		  void *data, unsigned int len)
-{
-	int rc = 0;
-
-	spin_lock_bh(&hif->tx_lock);
-
-	if (!hif->TxAvail) {
-		rc = 1;
-	} else {
-		__hif_xmit_pkt(hif, client_id, q_no, data, len, HIF_FIRST_BUFFER | HIF_LAST_BUFFER);
-		hif_tx_dma_start();
-	}
 	if (hif->TxAvail < (hif->TxRingSize >> 1))
 		__hif_tx_done_process(hif, TX_FREE_MAX_COUNT);
 
-	spin_unlock_bh(&hif->tx_lock);
+	return 0;
+}
 
-	return rc;
+/*
+ * TX completion interrupts (HIF_TXPKT_INT) are enabled per client only
+ * when a stopped TX queue needs wake-up notification, avoiding constant
+ * TX IRQ overhead during normal transmission.
+ */
+void pfe_hif_request_tx_irq(struct pfe_hif *hif, unsigned int client_id)
+{
+	unsigned long flags;
+
+	if (unlikely(client_id >= HIF_CLIENTS_MAX))
+		return;
+
+	spin_lock_irqsave(&hif->irq_lock, flags);
+	__set_bit(client_id, &hif->tx_irq_clients);
+	if (!napi_is_scheduled(&hif->napi))
+		writel_relaxed(HIF_INT_MASK | HIF_TXPKT_INT, HIF_INT_ENABLE);
+	spin_unlock_irqrestore(&hif->irq_lock, flags);
+}
+
+void pfe_hif_release_tx_irq(struct pfe_hif *hif, unsigned int client_id)
+{
+	unsigned long flags;
+
+	if (unlikely(client_id >= HIF_CLIENTS_MAX))
+		return;
+
+	spin_lock_irqsave(&hif->irq_lock, flags);
+	__clear_bit(client_id, &hif->tx_irq_clients);
+	if (!napi_is_scheduled(&hif->napi)) {
+		u32 mask = HIF_INT_MASK;
+
+		if (hif->tx_irq_clients)
+			mask |= HIF_TXPKT_INT;
+		writel_relaxed(mask, HIF_INT_ENABLE);
+	}
+	spin_unlock_irqrestore(&hif->irq_lock, flags);
 }
 
 static irqreturn_t hif_isr(int irq, void *dev_id)
@@ -542,16 +753,19 @@ static irqreturn_t hif_isr(int irq, void *dev_id)
 
 	int_status &= ~HIF_INT;
 
-	if (int_status & HIF_RXPKT_INT) {
-		int_status &= ~HIF_RXPKT_INT;
+	if (int_status & (HIF_RXPKT_INT | HIF_TXPKT_INT)) {
+		spin_lock(&hif->irq_lock);
+		if (int_status & HIF_TXPKT_INT) {
+			hif->tx_irq_count++;
+			writel_relaxed(HIF_TXPKT_INT, HIF_INT_SRC);
+		}
+		int_status &= ~(HIF_RXPKT_INT | HIF_TXPKT_INT);
 
 		/* Disable interrupts; the NAPI poll re-enables them. */
 		writel_relaxed(0, HIF_INT_ENABLE);
-
-		if (napi_schedule_prep(&hif->napi)) {
-			hif->napi_counters[NAPI_SCHED_COUNT]++;
-			__napi_schedule(&hif->napi);
-		}
+		hif->napi_counters[NAPI_SCHED_COUNT]++;
+		napi_schedule_irqoff(&hif->napi);
+		spin_unlock(&hif->irq_lock);
 	}
 
 	if (int_status) {
@@ -585,20 +799,62 @@ void hif_process_client_req(struct pfe_hif *hif, int req, int data1, int data2)
 	}
 }
 
+static bool pfe_hif_has_completed_tx(struct pfe_hif *hif)
+{
+	bool completed = false;
+
+	spin_lock_bh(&hif->tx_lock);
+	if (hif->TxAvail < hif->TxRingSize &&
+	    !(READ_ONCE(hif->TxBase[hif->Txtoclean].ctrl) & BD_CTRL_DESC_EN))
+		completed = true;
+	spin_unlock_bh(&hif->tx_lock);
+
+	return completed;
+}
+
+static void pfe_hif_tx_poll_notify(struct pfe_hif *hif)
+{
+	unsigned long clients = READ_ONCE(hif->tx_irq_clients);
+	unsigned int client_id;
+
+	if (!clients)
+		return;
+
+	hif_tx_done_process(hif, hif->TxRingSize);
+
+	for_each_set_bit(client_id, &clients, HIF_CLIENTS_MAX) {
+		if (hif->shm->gClient_status & (1 << client_id))
+			hif_lib_indicate_client(client_id, EVENT_TXDONE_IND, 0);
+	}
+}
+
 static int pfe_hif_rx_poll(struct napi_struct *napi, int budget)
 {
 	struct pfe_hif *hif = container_of(napi, struct pfe_hif, napi);
 	int work_done;
+	bool tx_more;
 
 	hif->napi_counters[NAPI_POLL_COUNT]++;
 
 	work_done = pfe_hif_rx_process(hif, budget);
+	pfe_hif_tx_poll_notify(hif);
+	tx_more = READ_ONCE(hif->tx_irq_clients) && pfe_hif_has_completed_tx(hif);
 
-	if (work_done < budget) {
-		napi_complete(napi);
-		writel_relaxed(HIF_INT_MASK, HIF_INT_ENABLE);
+	if (work_done < budget && !tx_more) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&hif->irq_lock, flags);
+		if (napi_complete_done(napi, work_done)) {
+			u32 mask = HIF_INT_MASK;
+
+			if (hif->tx_irq_clients)
+				mask |= HIF_TXPKT_INT;
+			writel_relaxed(mask, HIF_INT_ENABLE);
+		}
+		spin_unlock_irqrestore(&hif->irq_lock, flags);
 	} else {
 		hif->napi_counters[NAPI_FULL_BUDGET_COUNT]++;
+		return budget;
 	}
 
 	return work_done;
@@ -612,6 +868,11 @@ int pfe_hif_init(struct pfe *pfe)
 	hif->dev = pfe->dev;
 	hif->irq = pfe->hif_irq;
 
+	spin_lock_init(&hif->tx_lock);
+	spin_lock_init(&hif->lock);
+	spin_lock_init(&hif->irq_lock);
+	hif->tx_irq_clients = 0;
+
 	err = pfe_hif_alloc_descr(hif);
 	if (err)
 		return err;
@@ -619,17 +880,12 @@ int pfe_hif_init(struct pfe *pfe)
 	err = pfe_hif_init_buffers(hif);
 	if (err) {
 		dev_err(hif->dev, "%s: could not initialize buffer descriptors\n", __func__);
-		goto err_buffers;
+		goto err_descr;
 	}
 
 	/*
-	 * HIF's NAPI instance is shared by all future client net_devices
-	 * (GEM0-2, Stage P7-P9), not owned by any single one of them --
-	 * needs its own carrier net_device. init_dummy_netdev() (what the
-	 * vendor driver used) is no longer available to drivers as of
-	 * recent kernels; alloc_netdev_dummy() is the current public
-	 * replacement for exactly this (see e.g. mtk_eth_soc.c, a driver
-	 * with the same "one engine, several ports" shape as this one).
+	 * HIF's NAPI instance is shared at the HIF level -- needs its own
+	 * carrier net_device (alloc_netdev_dummy() in Linux 6.18).
 	 */
 	hif->dummy_dev = alloc_netdev_dummy(0);
 	if (!hif->dummy_dev) {
@@ -640,14 +896,10 @@ int pfe_hif_init(struct pfe *pfe)
 	netif_napi_add(hif->dummy_dev, &hif->napi, pfe_hif_rx_poll);
 	napi_enable(&hif->napi);
 
-	spin_lock_init(&hif->tx_lock);
-	spin_lock_init(&hif->lock);
-
 	hif_init();
 	hif_rx_enable();
 	hif_tx_enable();
 
-	/* Disable tx-done interrupt for now (only Rx/global are used). */
 	writel(HIF_INT_MASK, HIF_INT_ENABLE);
 
 	gpi_enable(HGPI_BASE_ADDR);
@@ -661,10 +913,16 @@ int pfe_hif_init(struct pfe *pfe)
 	return 0;
 
 err_irq:
+	writel(0, HIF_INT_ENABLE);
+	gpi_disable(HGPI_BASE_ADDR);
+	hif_rx_disable();
+	hif_tx_disable();
 	napi_disable(&hif->napi);
 	netif_napi_del(&hif->napi);
 	free_netdev(hif->dummy_dev);
 err_buffers:
+	pfe_hif_release_buffers(hif);
+err_descr:
 	pfe_hif_free_descr(hif);
 	return err;
 }
@@ -672,14 +930,28 @@ err_buffers:
 void pfe_hif_exit(struct pfe *pfe)
 {
 	struct pfe_hif *hif = &pfe->hif;
+	unsigned long flags;
 
 	hif->shm->gClient_status = 0;
+
+	spin_lock_irqsave(&hif->irq_lock, flags);
+	writel(0, HIF_INT_ENABLE);
+	writel(readl(HIF_INT_SRC), HIF_INT_SRC);
+	spin_unlock_irqrestore(&hif->irq_lock, flags);
+
+	devm_free_irq(hif->dev, hif->irq, hif);
 
 	gpi_disable(HGPI_BASE_ADDR);
 	hif_rx_disable();
 	hif_tx_disable();
 
 	napi_disable(&hif->napi);
+
+	spin_lock_irqsave(&hif->irq_lock, flags);
+	writel(0, HIF_INT_ENABLE);
+	writel(readl(HIF_INT_SRC), HIF_INT_SRC);
+	spin_unlock_irqrestore(&hif->irq_lock, flags);
+
 	netif_napi_del(&hif->napi);
 	free_netdev(hif->dummy_dev);
 
