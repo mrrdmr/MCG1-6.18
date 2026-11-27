@@ -514,11 +514,21 @@ void *hif_lib_tx_get_next_complete(struct hif_client_s *client, int qno,
 		queue->read_idx = (queue->read_idx + 1) & (queue->size - 1);
 		queue->tx_pending--;
 
-		if ((desc_flags & HIF_DATA_VALID) || data) {
-			*flags = desc_flags;
+		/*
+		 * Only report packet completion on the final descriptor
+		 * (HIF_LAST_BUFFER + HIF_DATA_VALID) with a valid skb;
+		 * non-final or partial descriptors must be retired first so
+		 * all SG DMA mappings and client slots are complete.
+		 */
+		if ((desc_flags & (HIF_LAST_BUFFER | HIF_DATA_VALID)) ==
+		    (HIF_LAST_BUFFER | HIF_DATA_VALID) && data) {
+			*flags = HIF_DATA_VALID;
 			spin_unlock_bh(&hif->tx_lock);
 			return data;
 		}
+
+		if (unlikely(data))
+			dev_kfree_skb_any(data);
 	}
 
 	spin_unlock_bh(&hif->tx_lock);
