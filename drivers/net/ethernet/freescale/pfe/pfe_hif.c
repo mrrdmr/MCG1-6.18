@@ -28,26 +28,13 @@
  *    begin with. Dropped; flagged here in case real-hardware Rx
  *    corruption ever points back at it.
  *
- * Rx packet buffers (as opposed to the descriptor ring, always
- * dma_alloc_coherent()) were originally kmalloc()+dma_map_single()/
- * dma_unmap_single(), matching a mainline streaming-DMA driver. Real-
- * hardware testing (Rx stuck at 0 packets on this port, while a
- * reference 3.2.26 vendor kernel/pfe.ko built and run on the exact
- * same hardware received traffic normally) traced this to the vendor
- * driver relying on kmalloc(GFP_DMA_NCNB) for Rx buffers specifically
- * -- a custom flag drawing from a boot-time-remapped, genuinely
- * non-cacheable (Device-type) physical zone, confirmed active in the
- * working reference config. Rx buffers now come from dma_alloc_
- * coherent() instead (pfe_hif_buf_alloc()/_free()/_dma() in
- * pfe_hif_lib.h), which gets the same non-cacheable guarantee through
- * the portable DMA API -- the same mechanism this driver already uses
- * for the descriptor ring, where Tx has proven it works. See the
- * comment above those helpers for why this also meant moving Rx off
- * zero-copy build_skb() in pfe_eth.c.
- *
- * Deferred to Stage P7-P9 (pfe_eth.c, the only caller of any of these):
- * the client TX path (__hif_xmit_pkt() and hif_xmit_pkt() are ported
- * since they're small and self-contained, but nothing calls them yet).
+ * Rx packet buffers are allocated as 2048-byte page fragments via
+ * netdev_alloc_frag_align() (pfe_hif_buf_alloc()/_free()/_map()/
+ * _unmap() in pfe_hif_lib.h) and mapped with streaming DMA
+ * (dma_map_single(..., DMA_FROM_DEVICE)). Storing the bus address in
+ * the first slot of PFE_PKT_HEADROOM keeps DMA metadata on a separate
+ * cache line from the packet payload and allows zero-copy build_skb()
+ * delivery in pfe_eth.c.
  */
 
 #include <linux/bitops.h>
@@ -92,33 +79,11 @@ static int pfe_hif_alloc_descr(struct pfe_hif *hif)
 	hif->RxRingSize = HIF_RX_DESC_NT;
 	hif->TxRingSize = HIF_TX_DESC_NT;
 
-	addr = dma_alloc_coherent(hif->dev, HIF_TX_DESC_NT * sizeof(struct hif_tso_hdr),
-				   &dma_addr, GFP_KERNEL);
-	if (!addr) {
-		dev_err(hif->dev, "%s: could not allocate per-packet tx header\n", __func__);
-		dma_free_coherent(hif->dev,
-				   hif->RxRingSize * sizeof(struct hif_desc) +
-				   hif->TxRingSize * sizeof(struct hif_desc),
-				   hif->descr_baseaddr_v, hif->descr_baseaddr_p);
-		hif->descr_baseaddr_v = NULL;
-		hif->descr_baseaddr_p = 0;
-		return -ENOMEM;
-	}
-
-	hif->tso_hdr_p = dma_addr;
-	hif->tso_hdr_v = addr;
-
 	return 0;
 }
 
 static void pfe_hif_free_descr(struct pfe_hif *hif)
 {
-	if (hif->tso_hdr_v) {
-		dma_free_coherent(hif->dev, hif->TxRingSize * sizeof(struct hif_tso_hdr),
-				   hif->tso_hdr_v, hif->tso_hdr_p);
-		hif->tso_hdr_v = NULL;
-		hif->tso_hdr_p = 0;
-	}
 	if (hif->descr_baseaddr_v) {
 		dma_free_coherent(hif->dev,
 				   hif->RxRingSize * sizeof(struct hif_desc) +
@@ -207,6 +172,8 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 	first_desc_p = hif->descr_baseaddr_p;
 
 	for (i = 0; i < hif->RxRingSize; i++) {
+		u32 next_idx = (i + 1) & (hif->RxRingSize - 1);
+
 		data = pfe_hif_buf_map(hif->dev, (void *)hif->shm->rx_buf_pool[i]);
 		if (!data) {
 			while (i-- > 0) {
@@ -221,14 +188,12 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 
 		desc->data = lower_32_bits(data);
 		desc->status = 0;
-		desc->next = lower_32_bits(first_desc_p + (i + 1) * sizeof(struct hif_desc));
+		desc->next = lower_32_bits(first_desc_p + next_idx * sizeof(struct hif_desc));
 		wmb();
 		desc->ctrl = BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM | BD_CTRL_DIR |
 			     BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size);
 		desc++;
 	}
-	desc--;
-	desc->next = lower_32_bits(first_desc_p);
 
 	hif->RxtocleanIndex = 0;
 
@@ -241,11 +206,11 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 
 	desc = hif->TxBase;
 	for (i = 0; i < hif->TxRingSize; i++) {
-		desc->next = lower_32_bits(tx_base_p + (i + 1) * sizeof(struct hif_desc));
+		u32 next_idx = (i + 1) & (hif->TxRingSize - 1);
+
+		desc->next = lower_32_bits(tx_base_p + next_idx * sizeof(struct hif_desc));
 		desc++;
 	}
-	desc--;
-	desc->next = lower_32_bits(tx_base_p);
 
 	hif->TxAvail = hif->TxRingSize;
 	hif->Txtosend = 0;

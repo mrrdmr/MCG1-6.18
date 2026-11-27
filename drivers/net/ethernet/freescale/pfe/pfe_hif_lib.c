@@ -11,11 +11,12 @@
  * out of scope (TSO, TX credit/QoS).
  *
  * page_mode/LRO support is dropped, not deferred: it's a performance
- * feature (larger receive buffers backed by whole pages instead of
- * kmalloc'd blocks) irrelevant to reaching basic connectivity, and
- * carrying its conditional paths through pfe_hif.c/pfe_hif_lib.c would
- * just be more surface area to get wrong for no benefit at this stage.
- * pfe_pkt_size/pfe_pkt_headroom are fixed at their non-LRO values.
+ * feature (larger multi-page receive buffers instead of fixed 2048-byte
+ * page fragments allocated via netdev_alloc_frag_align()) irrelevant to
+ * reaching basic connectivity, and carrying its conditional paths
+ * through pfe_hif.c/pfe_hif_lib.c would just be more surface area to
+ * get wrong for no benefit at this stage. pfe_pkt_size/pfe_pkt_headroom
+ * are fixed at their non-LRO values.
  */
 
 #include <linux/kernel.h>

@@ -179,8 +179,6 @@ struct pfe_hif {
 	u32 Txtoclean;
 	u32 TxAvail;
 	struct hif_desc_sw tx_sw_queue[HIF_TX_DESC_NT];
-	struct hif_tso_hdr *tso_hdr_v;
-	dma_addr_t tso_hdr_p;
 
 	spinlock_t tx_lock;	/* protects TX ring indices, TxAvail, and tx_sw_queue */
 	spinlock_t lock;	/* protects client table / Rx ring state (BH context) */

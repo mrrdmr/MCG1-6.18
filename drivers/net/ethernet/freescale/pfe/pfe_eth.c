@@ -516,6 +516,9 @@ static void pfe_eth_maybe_stop_txq(struct pfe_eth_priv_s *priv, unsigned int sto
 	struct net_device *dev = priv->dev;
 	unsigned int wake_thres = max_t(unsigned int, PFE_TX_WAKE_THRES, stop_thres);
 
+	BUILD_BUG_ON(PFE_TX_STOP_THRES < PFE_TX_MAX_SG_DESCS);
+	BUILD_BUG_ON(PFE_TX_WAKE_THRES < PFE_TX_STOP_THRES);
+
 	spin_lock_bh(&priv->tx_clean_lock);
 
 	if (unlikely(priv->closing || !netif_running(dev))) {
@@ -948,13 +951,33 @@ static int pfe_eth_set_features(struct net_device *dev, netdev_features_t featur
 	return 0;
 }
 
+static int pfe_eth_set_mac_address(struct net_device *dev, void *p)
+{
+	struct pfe_eth_priv_s *priv = netdev_priv(dev);
+	MAC_ADDR addr;
+	int rc;
+
+	rc = eth_mac_addr(dev, p);
+	if (rc)
+		return rc;
+
+	if (netif_running(dev)) {
+		addr.bottom = get_unaligned_le32(dev->dev_addr);
+		addr.top = get_unaligned_le16(dev->dev_addr + 4);
+		gemac_set_laddrN(priv->EMAC_baseaddr, &addr, 1);
+		pfe_eth_class_register_port(priv);
+	}
+
+	return 0;
+}
+
 static const struct net_device_ops pfe_netdev_ops = {
 	.ndo_open = pfe_eth_open,
 	.ndo_set_features = pfe_eth_set_features,
 	.ndo_stop = pfe_eth_close,
 	.ndo_start_xmit = pfe_eth_send_packet,
 	.ndo_tx_timeout = pfe_eth_tx_timeout,
-	.ndo_set_mac_address = eth_mac_addr,
+	.ndo_set_mac_address = pfe_eth_set_mac_address,
 	.ndo_validate_addr = eth_validate_addr,
 	.ndo_set_rx_mode = pfe_eth_set_multi,
 	.ndo_eth_ioctl = phy_do_ioctl,
@@ -1171,8 +1194,12 @@ int pfe_eth_init(struct pfe *pfe)
 			continue;
 
 		rc = pfe_eth_probe_gem0(pfe, np);
-		if (rc)
+		if (rc) {
 			dev_err(pfe->dev, "failed to probe %pOF: %d\n", np, rc);
+			of_node_put(np);
+			pfe_eth_mdio_exit();
+			return rc;
+		}
 		of_node_put(np);
 		break;
 	}
