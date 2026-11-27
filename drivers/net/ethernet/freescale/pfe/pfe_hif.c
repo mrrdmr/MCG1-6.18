@@ -111,6 +111,17 @@ static void pfe_hif_unmap_tx_desc(struct pfe_hif *hif, struct hif_desc_sw *desc_
 	desc_sw->map_type = PFE_TX_MAP_NONE;
 }
 
+static void pfe_hif_reset_tx_desc_sw(struct hif_desc_sw *desc_sw)
+{
+	desc_sw->data = DMA_MAPPING_ERROR;
+	desc_sw->skb = NULL;
+	desc_sw->len = 0;
+	desc_sw->q_idx = 0;
+	desc_sw->client_id = HIF_CLIENTS_MAX;
+	desc_sw->q_no = 0;
+	desc_sw->map_type = PFE_TX_MAP_NONE;
+}
+
 static void pfe_hif_release_buffers(struct pfe_hif *hif)
 {
 	struct hif_desc *desc = hif->RxBase;
@@ -144,6 +155,7 @@ static void pfe_hif_release_buffers(struct pfe_hif *hif)
 
 			desc_sw->skb = NULL;
 			pfe_hif_unmap_tx_desc(hif, desc_sw);
+			pfe_hif_reset_tx_desc_sw(desc_sw);
 			if (unlikely(skb))
 				dev_kfree_skb_any(skb);
 			desc->data = 0;
@@ -206,6 +218,8 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 	tx_base_p = first_desc_p + hif->RxRingSize * sizeof(struct hif_desc);
 	memset(hif->TxBase, 0, hif->TxRingSize * sizeof(struct hif_desc));
 	memset(hif->tx_sw_queue, 0, sizeof(hif->tx_sw_queue));
+	for (i = 0; i < hif->TxRingSize; i++)
+		pfe_hif_reset_tx_desc_sw(&hif->tx_sw_queue[i]);
 
 	desc = hif->TxBase;
 	for (i = 0; i < hif->TxRingSize; i++) {
@@ -240,39 +254,49 @@ static void pfe_hif_mark_client_orphaned(struct pfe_hif *hif, unsigned int clien
 }
 
 /*
- * Single-pass teardown helper for HIF descriptors orphaned from a client:
- * unmaps DMA and releases skb once for completed orphaned entries whose
- * ownership has already transferred from hardware to HIF.
+ * Drain contiguous completed orphaned descriptors from Txtoclean: unmaps
+ * DMA, releases skb once, resets desc_sw to a clean reusable state, and
+ * advances Txtoclean / TxAvail consistently with __hif_tx_done_process().
  */
 static void pfe_hif_drain_orphaned_tx(struct pfe_hif *hif)
 {
-	unsigned int active = hif->TxRingSize - hif->TxAvail;
-	unsigned int i;
+	int ttc, tx_avl;
 
 	lockdep_assert_held(&hif->tx_lock);
 
-	for (i = 0; i < active; i++) {
-		unsigned int cur = (hif->Txtoclean + i) & (hif->TxRingSize - 1);
-		struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[cur];
-		struct hif_desc *desc = hif->TxBase + cur;
+	ttc = hif->Txtoclean;
+	tx_avl = hif->TxAvail;
+
+	while (tx_avl < hif->TxRingSize) {
+		struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[ttc];
+		struct hif_desc *desc = hif->TxBase + ttc;
+		struct sk_buff *skb;
 
 		if (desc_sw->client_id != HIF_CLIENTS_MAX)
-			continue;
+			break;
 
 		if (READ_ONCE(desc->ctrl) & BD_CTRL_DESC_EN)
-			continue;
+			break;
 
 		dma_rmb();
 
-		if (desc_sw->skb) {
-			struct sk_buff *skb = desc_sw->skb;
-
-			desc_sw->skb = NULL;
+		skb = desc_sw->skb;
+		desc_sw->skb = NULL;
+		if (unlikely(skb))
 			dev_kfree_skb_any(skb);
-		}
 
 		pfe_hif_unmap_tx_desc(hif, desc_sw);
+		pfe_hif_reset_tx_desc_sw(desc_sw);
+		desc->data = 0;
+		desc->status = 0;
+		WRITE_ONCE(desc->ctrl, 0);
+
+		inc_hif_txidx(ttc);
+		tx_avl++;
 	}
+
+	hif->Txtoclean = ttc;
+	hif->TxAvail = tx_avl;
 }
 
 static int pfe_hif_client_register(struct pfe_hif *hif, u32 client_id,
@@ -373,6 +397,8 @@ void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 		if (!(q_ctrl & CL_DESC_OWN) && skb)
 			dev_kfree_skb_any(skb);
 	}
+
+	pfe_hif_drain_orphaned_tx(hif);
 }
 
 /*
@@ -733,6 +759,7 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 		}
 
 		pfe_hif_unmap_tx_desc(hif, desc_sw);
+		pfe_hif_reset_tx_desc_sw(desc_sw);
 
 		inc_hif_txidx(ttc);
 		tx_avl++;
