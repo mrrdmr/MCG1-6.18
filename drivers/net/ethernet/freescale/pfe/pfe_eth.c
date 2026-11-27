@@ -391,7 +391,9 @@ static void pfe_eth_stop(struct pfe_eth_priv_s *priv)
 static void __pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
 {
 	struct net_device *dev = priv->dev;
-	int reap_max = max_t(int, count, PFE_ETH_TX_FREE_MAX);
+	int reap_max = min_t(int, max_t(int, count * PFE_TX_MAX_SG_DESCS,
+					PFE_ETH_TX_FREE_MAX),
+			     EMAC_TXQ_DEPTH);
 	unsigned int completed_pkts = 0;
 	unsigned int completed_bytes = 0;
 	struct sk_buff *skb;
@@ -678,9 +680,12 @@ static void pfe_eth_unmap_frag_segs(struct device *dma_dev,
 	unsigned int i;
 
 	for (i = 0; i < count; i++) {
-		if (segs[i].dma)
+		if (segs[i].map_type == PFE_TX_MAP_PAGE)
 			dma_unmap_page(dma_dev, segs[i].dma, segs[i].len,
 				       DMA_TO_DEVICE);
+		else if (segs[i].map_type == PFE_TX_MAP_SINGLE)
+			dma_unmap_single(dma_dev, segs[i].dma, segs[i].len,
+					 DMA_TO_DEVICE);
 	}
 }
 
@@ -781,7 +786,9 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 					return NETDEV_TX_OK;
 				}
 
+				frag_segs[nr_frag_segs].skb = NULL;
 				frag_segs[nr_frag_segs].len = chunk;
+				frag_segs[nr_frag_segs].q_idx = 0;
 				frag_segs[nr_frag_segs].map_type = PFE_TX_MAP_PAGE;
 				nr_frag_segs++;
 				off += chunk;
