@@ -1081,7 +1081,7 @@ static void pfe_eth_extphy_clk_release(void *data)
 	clk_put(clk);
 }
 
-static char pfe_boot_mac_param[64];
+static char pfe_boot_mac_param[18];
 static u8 pfe_boot_mac_addr[ETH_ALEN];
 static bool pfe_boot_mac_addr_valid;
 
@@ -1100,7 +1100,7 @@ static void pfe_parse_mac_param(void)
 }
 
 module_param_string(mac_addr, pfe_boot_mac_param, sizeof(pfe_boot_mac_param), 0444);
-MODULE_PARM_DESC(mac_addr, "Comma-separated initial MAC addresses for GEM ports");
+MODULE_PARM_DESC(mac_addr, "Initial MAC address for GEM0");
 
 static int pfe_eth_probe_gem0(struct pfe *pfe, struct device_node *np)
 {
