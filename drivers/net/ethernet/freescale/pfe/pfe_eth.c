@@ -172,7 +172,7 @@ static int pfe_eth_mdio_init(struct pfe *pfe, struct device_node *np)
 	bus->write = pfe_eth_mdio_write;
 	bus->reset = pfe_eth_mdio_reset;
 	bus->priv = &pfe_mdio_priv;
-	bus->phy_mask = 0; /* scan every address -- see banner comment */
+	bus->phy_mask = 0; /* scan every address (0..31) */
 	bus->parent = pfe->dev;
 	snprintf(bus->id, MII_BUS_ID_SIZE, "ls1024a-pfe-mdio");
 
@@ -1022,6 +1022,11 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 		}
 	}
 
+	/*
+	 * Do not acquire hif->tx_lock here: hif_lib_xmit_pkt_sg() takes
+	 * hif->tx_lock internally (spin_lock_bh() is non-reentrant, and
+	 * lock order is tx_clean_lock -> hif->tx_lock).
+	 */
 	rc = hif_lib_xmit_pkt_sg(&priv->client, PFE_ETH_TXQ,
 				 skb->data, skb_headlen(skb),
 				 frag_segs, nr_frag_segs, ctrl, skb,
@@ -1454,8 +1459,9 @@ static int pfe_eth_probe_gem0(struct pfe *pfe, struct device_node *np)
 	 * Hardware TSO (struct hif_tso_hdr, HIF_CTRL_TX_TSO/_TSO6/_TSO_END in
 	 * pfe_hif.h) isn't wired up yet because its exact field semantics
 	 * (byte order and units of ip_off/ip_id/ip_len/tcp_off/tcp_seq)
-	 * aren't confirmed, so large GSO/TSO frames are segmented by the
-	 * Linux 6.18 network stack before reaching ndo_start_xmit().
+	 * aren't confirmed, and guessing wrong risks silent TCP stream
+	 * corruption; large GSO/TSO frames are segmented by the Linux 6.18
+	 * network stack before reaching ndo_start_xmit().
 	 */
 	dev->hw_features = NETIF_F_RXCSUM | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			    NETIF_F_SG;

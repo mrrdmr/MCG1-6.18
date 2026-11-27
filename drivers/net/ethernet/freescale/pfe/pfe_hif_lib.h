@@ -12,10 +12,9 @@
  * (hif_lib_xmit_pkt_sg(), hif_lib_tx_get_next_complete()) and
  * hif_lib_event_handler_start() (the Rx re-arm half of the
  * hif_lib_indicate_client() edge-triggered wakeup below). Still out of
- * scope: TSO and TX credit/QoS accounting -- neither is needed for
- * plain, non-jumbo Ethernet traffic at the pace this baseline targets
- * (DHCP+ping), and dropping them avoids reintroducing the FCI-adjacent
- * machinery this whole port has deliberately left out since Stage P1.
+ * scope: hardware TSO and multi-queue TX credit/QoS accounting --
+ * dropping them avoids reintroducing the FCI-adjacent machinery this
+ * whole port has deliberately left out since Stage P1.
  */
 #ifndef _PFE_HIF_LIB_H_
 #define _PFE_HIF_LIB_H_
@@ -213,10 +212,10 @@ static inline void pfe_hif_buf_unmap(struct device *dev, void *pkt)
  * Pool of HIF_RX_DESC_NT spare buffers pre-allocated via GFP_KERNEL in
  * pfe_hif_lib_init() and recycled via plain array push/pop, keeping page-
  * fragment allocator calls off the hot RX path in the steady state (with
- * a netdev_alloc_frag_align() GFP_ATOMIC fallback in client_put_rxpacket()
- * if the spare pool ever drains). Sized at HIF_RX_DESC_NT because the
- * drain runs synchronously inside the HIF NAPI poll, so at most a small
- * number of buffers are in flight between HIF dequeue and build_skb().
+ * pfe_hif_buf_alloc() fallback in client_put_rxpacket() if the spare
+ * pool ever drains). Sized at HIF_RX_DESC_NT because the drain runs
+ * synchronously inside the HIF NAPI poll, so at most a small number of
+ * buffers are in flight between HIF dequeue and build_skb().
  */
 void *pfe_hif_spare_buf_get(void);
 void pfe_hif_spare_buf_put(void *buf);
