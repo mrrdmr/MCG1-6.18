@@ -254,10 +254,31 @@ static void pfe_hif_mark_client_orphaned(struct pfe_hif *hif, unsigned int clien
 }
 
 /*
- * Synchronize client TX ring accounting only for a complete, contiguous SG
- * chain starting at q->read_idx (and matching q->ack_idx) where every
- * descriptor in the chain is out of HIF ownership. Retires the entire chain's
- * descriptors and updates ack_idx, read_idx, and tx_pending together.
+ * Check whether client descriptor q_idx has a completed orphaned descriptor
+ * in hif->tx_sw_queue (still active in HIF ring and no longer owned by HW).
+ */
+static bool pfe_hif_orphan_desc_done(struct pfe_hif *hif, unsigned int q_idx)
+{
+	unsigned int active = hif->TxRingSize - hif->TxAvail;
+	unsigned int i;
+
+	for (i = 0; i < active; i++) {
+		unsigned int hw_idx = (hif->Txtoclean + i) & (hif->TxRingSize - 1);
+		struct hif_desc_sw *sw = &hif->tx_sw_queue[hw_idx];
+		struct hif_desc *hw = hif->TxBase + hw_idx;
+
+		if (sw->client_id == HIF_CLIENTS_MAX && sw->q_idx == q_idx)
+			return !(READ_ONCE(hw->ctrl) & BD_CTRL_DESC_EN);
+	}
+
+	/* Already drained past Txtoclean if q_idx was earlier in an active chain. */
+	return true;
+}
+
+/*
+ * Validate every descriptor in the full SG chain from q->read_idx through
+ * the HIF_LAST_BUFFER descriptor before changing ack_idx, read_idx, or
+ * tx_pending.
  */
 static void pfe_hif_orphan_sync_client_queue(struct pfe_hif *hif,
 					     struct hif_client_tx_queue *q)
@@ -273,41 +294,32 @@ static void pfe_hif_orphan_sync_client_queue(struct pfe_hif *hif,
 
 	mask = q->size - 1;
 
-	for (step = 0; step < q->tx_pending && step < PFE_TX_MAX_SG_DESCS; step++) {
+	for (step = 0; step < q->tx_pending; step++) {
 		unsigned int q_idx = (q->read_idx + step) & mask;
 		struct tx_queue_desc *q_desc = q->base + q_idx;
 		u32 q_ctrl = READ_ONCE(q_desc->ctrl);
 		u32 desc_flags = CL_DESC_GET_FLAGS(q_ctrl);
-		unsigned int hw_idx;
-		bool matched_completed = false;
 
 		if (step == 0 && !(desc_flags & HIF_FIRST_BUFFER))
 			return;
 		if (step > 0 && (desc_flags & HIF_FIRST_BUFFER))
 			return;
 
-		for (hw_idx = 0; hw_idx < (unsigned int)hif->TxRingSize; hw_idx++) {
-			struct hif_desc_sw *sw = &hif->tx_sw_queue[hw_idx];
-			struct hif_desc *hw = hif->TxBase + hw_idx;
-
-			if (sw->client_id == HIF_CLIENTS_MAX && sw->q_idx == q_idx) {
-				if (READ_ONCE(hw->ctrl) & BD_CTRL_DESC_EN)
-					return;
-				matched_completed = true;
-				break;
-			}
-		}
-
-		if (!matched_completed)
+		if (!pfe_hif_orphan_desc_done(hif, q_idx))
 			return;
 
 		if (desc_flags & HIF_LAST_BUFFER) {
-			if (!(desc_flags & HIF_DATA_VALID))
+			if (step + 1 > PFE_TX_MAX_SG_DESCS ||
+			    !(desc_flags & HIF_DATA_VALID))
 				return;
 			chain_len = step + 1;
 			found_last = true;
 			break;
 		}
+
+		if (step + 1 >= PFE_TX_MAX_SG_DESCS ||
+		    (desc_flags & HIF_DATA_VALID))
+			return;
 	}
 
 	if (!found_last || !chain_len)
