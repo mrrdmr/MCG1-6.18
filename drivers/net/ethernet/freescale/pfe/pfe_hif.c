@@ -254,60 +254,84 @@ static void pfe_hif_mark_client_orphaned(struct pfe_hif *hif, unsigned int clien
 }
 
 /*
- * Synchronize a single completed orphan slot on the client TX ring without
- * leaving partial index/pending updates:
- *  - Only updates when q->ack_idx == q_idx and q->tx_pending > 0.
- *  - Clears q_desc->data and CL_DESC_OWN, advancing ack_idx once.
- *  - If q->read_idx == q_idx, clears q_desc->ctrl, advances read_idx once,
- *    and decrements tx_pending by 1 in the same step.
- * Returns true if synchronized (or no queue/pending entry applies), or false
- * if client queue state cannot be matched cleanly at this slot.
+ * Synchronize client TX ring accounting only for a complete, contiguous SG
+ * chain starting at q->read_idx (and matching q->ack_idx) where every
+ * descriptor in the chain is out of HIF ownership. Retires the entire chain's
+ * descriptors and updates ack_idx, read_idx, and tx_pending together.
  */
-static bool pfe_hif_orphan_sync_client_queue(struct hif_client_tx_queue *q,
-					     unsigned int q_idx)
+static void pfe_hif_orphan_sync_client_queue(struct pfe_hif *hif,
+					     struct hif_client_tx_queue *q)
 {
-	struct tx_queue_desc *q_desc;
-	u32 q_ctrl;
-	unsigned int mask;
+	unsigned int mask, chain_len = 0, step;
+	bool found_last = false;
 
-	if (!q)
-		return true;
+	if (!q || !q->base || !q->size || !is_power_of_2(q->size) || !q->tx_pending)
+		return;
 
-	if (!q->base || !q->size || !is_power_of_2(q->size) || q_idx >= q->size)
-		return false;
-
-	if (!q->tx_pending)
-		return true;
-
-	if (q->ack_idx != q_idx)
-		return false;
+	if (q->ack_idx != q->read_idx)
+		return;
 
 	mask = q->size - 1;
-	q_desc = q->base + q_idx;
-	q_ctrl = READ_ONCE(q_desc->ctrl);
-	q_desc->data = NULL;
-	smp_wmb();
 
-	if (q->read_idx == q_idx) {
-		WRITE_ONCE(q_desc->ctrl, 0);
-		q->read_idx = (q_idx + 1) & mask;
-		q->ack_idx = (q_idx + 1) & mask;
-		q->tx_pending--;
-	} else {
-		WRITE_ONCE(q_desc->ctrl, q_ctrl & ~CL_DESC_OWN);
-		q->ack_idx = (q_idx + 1) & mask;
+	for (step = 0; step < q->tx_pending && step < PFE_TX_MAX_SG_DESCS; step++) {
+		unsigned int q_idx = (q->read_idx + step) & mask;
+		struct tx_queue_desc *q_desc = q->base + q_idx;
+		u32 q_ctrl = READ_ONCE(q_desc->ctrl);
+		u32 desc_flags = CL_DESC_GET_FLAGS(q_ctrl);
+		unsigned int hw_idx;
+		bool matched_completed = false;
+
+		if (step == 0 && !(desc_flags & HIF_FIRST_BUFFER))
+			return;
+		if (step > 0 && (desc_flags & HIF_FIRST_BUFFER))
+			return;
+
+		for (hw_idx = 0; hw_idx < (unsigned int)hif->TxRingSize; hw_idx++) {
+			struct hif_desc_sw *sw = &hif->tx_sw_queue[hw_idx];
+			struct hif_desc *hw = hif->TxBase + hw_idx;
+
+			if (sw->client_id == HIF_CLIENTS_MAX && sw->q_idx == q_idx) {
+				if (READ_ONCE(hw->ctrl) & BD_CTRL_DESC_EN)
+					return;
+				matched_completed = true;
+				break;
+			}
+		}
+
+		if (!matched_completed)
+			return;
+
+		if (desc_flags & HIF_LAST_BUFFER) {
+			if (!(desc_flags & HIF_DATA_VALID))
+				return;
+			chain_len = step + 1;
+			found_last = true;
+			break;
+		}
 	}
 
-	return true;
+	if (!found_last || !chain_len)
+		return;
+
+	for (step = 0; step < chain_len; step++) {
+		unsigned int q_idx = (q->read_idx + step) & mask;
+		struct tx_queue_desc *q_desc = q->base + q_idx;
+
+		q_desc->data = NULL;
+		smp_wmb();
+		WRITE_ONCE(q_desc->ctrl, 0);
+	}
+
+	q->ack_idx = (q->read_idx + chain_len) & mask;
+	q->read_idx = (q->read_idx + chain_len) & mask;
+	q->tx_pending -= chain_len;
 }
 
 /*
- * Drain contiguous completed orphaned descriptors from Txtoclean:
- * synchronizes client ring state first, unmaps DMA, releases skb once,
- * resets desc_sw (setting client_id = HIF_CLIENTS_MAX and skb = NULL so
- * any still-active hardware descriptors later reclaim safely without client
- * state), and advances Txtoclean / TxAvail together. Returns the number of
- * drained descriptors.
+ * Drain contiguous completed orphaned descriptors from Txtoclean: unmaps
+ * DMA, releases skb once, resets desc_sw to a clean reusable state, and
+ * advances Txtoclean / TxAvail together. Synchronizes any matching complete
+ * client queue chain afterward. Returns the number of drained descriptors.
  */
 static unsigned int pfe_hif_drain_orphaned_tx(struct pfe_hif *hif,
 					      struct hif_client_tx_queue *q)
@@ -333,9 +357,6 @@ static unsigned int pfe_hif_drain_orphaned_tx(struct pfe_hif *hif,
 
 		dma_rmb();
 
-		if (!pfe_hif_orphan_sync_client_queue(q, desc_sw->q_idx))
-			break;
-
 		skb = desc_sw->skb;
 		desc_sw->skb = NULL;
 		if (unlikely(skb))
@@ -354,6 +375,8 @@ static unsigned int pfe_hif_drain_orphaned_tx(struct pfe_hif *hif,
 
 	hif->Txtoclean = ttc;
 	hif->TxAvail = tx_avl;
+
+	pfe_hif_orphan_sync_client_queue(hif, q);
 
 	return drained;
 }
@@ -1148,3 +1171,4 @@ void pfe_hif_exit(struct pfe *pfe)
 	pfe_hif_release_buffers(hif);
 	pfe_hif_free_descr(hif);
 }
+```[cite: 2]
