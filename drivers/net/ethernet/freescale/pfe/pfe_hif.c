@@ -253,12 +253,37 @@ static void pfe_hif_mark_client_orphaned(struct pfe_hif *hif, unsigned int clien
 	}
 }
 
+static void pfe_hif_orphan_sync_client_queue(struct hif_client_tx_queue *q,
+					     unsigned int q_idx)
+{
+	struct tx_queue_desc *q_desc;
+	u32 q_ctrl;
+
+	if (!q || !q->base || !q->size || !is_power_of_2(q->size) ||
+	    !q->tx_pending || q_idx >= q->size)
+		return;
+
+	if (q->ack_idx == q_idx) {
+		q_desc = q->base + q_idx;
+		q_ctrl = READ_ONCE(q_desc->ctrl);
+		q_desc->data = NULL;
+		WRITE_ONCE(q_desc->ctrl, q_ctrl & ~CL_DESC_OWN);
+		q->ack_idx = (q_idx + 1) & (q->size - 1);
+		if (q->read_idx == q_idx && q->tx_pending > 0) {
+			WRITE_ONCE(q_desc->ctrl, 0);
+			q->read_idx = (q_idx + 1) & (q->size - 1);
+			q->tx_pending--;
+		}
+	}
+}
+
 /*
  * Drain contiguous completed orphaned descriptors from Txtoclean: unmaps
  * DMA, releases skb once, resets desc_sw to a clean reusable state, and
  * advances Txtoclean / TxAvail consistently with __hif_tx_done_process().
  */
-static void pfe_hif_drain_orphaned_tx(struct pfe_hif *hif)
+static void pfe_hif_drain_orphaned_tx(struct pfe_hif *hif,
+				      struct hif_client_tx_queue *q)
 {
 	int ttc, tx_avl;
 
@@ -279,6 +304,8 @@ static void pfe_hif_drain_orphaned_tx(struct pfe_hif *hif)
 			break;
 
 		dma_rmb();
+
+		pfe_hif_orphan_sync_client_queue(q, desc_sw->q_idx);
 
 		skb = desc_sw->skb;
 		desc_sw->skb = NULL;
@@ -356,7 +383,7 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 		hif->shm->gClient_status &= ~(1 << client_id);
 		memset(&hif->client[client_id], 0, sizeof(hif->client[client_id]));
 		pfe_hif_mark_client_orphaned(hif, client_id);
-		pfe_hif_drain_orphaned_tx(hif);
+		pfe_hif_drain_orphaned_tx(hif, NULL);
 	}
 
 	spin_unlock_bh(&hif->tx_lock);
@@ -398,7 +425,7 @@ void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 			dev_kfree_skb_any(skb);
 	}
 
-	pfe_hif_drain_orphaned_tx(hif);
+	pfe_hif_drain_orphaned_tx(hif, q);
 }
 
 /*
@@ -653,8 +680,9 @@ pkt_drop:
 /*
  * Validate client TX descriptor position and ownership before transferring
  * skb ownership from HIF (desc_sw->skb, CL_DESC_OWN set) to the client ring
- * (desc->data, CL_DESC_OWN clear). On validation failure, leaves client and
- * hardware ownership untouched and returns an error.
+ * (desc->data, CL_DESC_OWN clear). On validation failure, leaves client
+ * descriptor state untouched and returns an error so the caller can release
+ * the skb cleanly and advance ring reclamation.
  */
 static int client_ack_txpacket(struct pfe_hif *hif, unsigned int client_id,
 			       unsigned int q_no, unsigned int q_idx,
@@ -737,6 +765,7 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 
 	while (tx_avl < hif->TxRingSize && count--) {
 		struct sk_buff *skb;
+		int ack_err = 0;
 
 		desc = hif->TxBase + ttc;
 		if (READ_ONCE(desc->ctrl) & BD_CTRL_DESC_EN)
@@ -749,11 +778,11 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 		desc_sw->skb = NULL;
 
 		if (desc_sw->client_id < HIF_CLIENTS_MAX) {
-			if (client_ack_txpacket(hif, desc_sw->client_id,
-						desc_sw->q_no, desc_sw->q_idx,
-						skb) && skb) {
+			ack_err = client_ack_txpacket(hif, desc_sw->client_id,
+							desc_sw->q_no, desc_sw->q_idx,
+							skb);
+			if (unlikely(ack_err) && skb)
 				dev_kfree_skb_any(skb);
-			}
 		} else if (unlikely(skb)) {
 			dev_kfree_skb_any(skb);
 		}

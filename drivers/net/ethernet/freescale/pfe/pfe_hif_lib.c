@@ -490,9 +490,10 @@ int hif_lib_xmit_pkt_sg(struct hif_client_s *client, unsigned int qno,
 }
 
 /*
- * Atomically dequeue one complete packet chain (HIF_FIRST_BUFFER through
- * HIF_LAST_BUFFER | HIF_DATA_VALID) only after every descriptor in the
- * chain has completed DMA (!(ctrl & CL_DESC_OWN)) and passed framing checks.
+ * Atomically dequeue one complete contiguous packet chain
+ * (HIF_FIRST_BUFFER through HIF_LAST_BUFFER | HIF_DATA_VALID) only after
+ * every descriptor in the chain is observed non-owned (!(ctrl & CL_DESC_OWN))
+ * and valid.
  */
 void *hif_lib_tx_get_next_complete(struct hif_client_s *client, int qno,
 				    unsigned int *flags, int count)
