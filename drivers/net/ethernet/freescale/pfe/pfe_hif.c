@@ -254,19 +254,20 @@ static void pfe_hif_mark_client_orphaned(struct pfe_hif *hif, unsigned int clien
 }
 
 /*
- * Synchronize client TX ring pointers/accounting for a completed orphan
- * descriptor in a single atomic step per slot:
+ * Synchronize a single completed orphan slot on the client TX ring without
+ * leaving partial index/pending updates:
+ *  - Only updates when q->ack_idx == q_idx and q->tx_pending > 0.
  *  - Clears q_desc->data and CL_DESC_OWN, advancing ack_idx once.
- *  - If q->read_idx == q_idx and q->tx_pending > 0, retires the slot once
- *    (q_desc->ctrl = 0, read_idx++, tx_pending--).
- * Returns true if the client queue was synchronized or no active queue
- * remains.
+ *  - If q->read_idx == q_idx, clears q_desc->ctrl, advances read_idx once,
+ *    and decrements tx_pending by 1 in the same step.
+ * Returns true if synchronized (or no queue/pending entry applies), or false
+ * if client queue state cannot be matched cleanly at this slot.
  */
 static bool pfe_hif_orphan_sync_client_queue(struct hif_client_tx_queue *q,
 					     unsigned int q_idx)
 {
 	struct tx_queue_desc *q_desc;
-	u32 q_ctrl, next_ctrl;
+	u32 q_ctrl;
 	unsigned int mask;
 
 	if (!q)
@@ -285,18 +286,15 @@ static bool pfe_hif_orphan_sync_client_queue(struct hif_client_tx_queue *q,
 	q_desc = q->base + q_idx;
 	q_ctrl = READ_ONCE(q_desc->ctrl);
 	q_desc->data = NULL;
+	smp_wmb();
 
 	if (q->read_idx == q_idx) {
-		next_ctrl = 0;
-		smp_wmb();
-		WRITE_ONCE(q_desc->ctrl, next_ctrl);
-		q->ack_idx = (q_idx + 1) & mask;
+		WRITE_ONCE(q_desc->ctrl, 0);
 		q->read_idx = (q_idx + 1) & mask;
+		q->ack_idx = (q_idx + 1) & mask;
 		q->tx_pending--;
 	} else {
-		next_ctrl = q_ctrl & ~CL_DESC_OWN;
-		smp_wmb();
-		WRITE_ONCE(q_desc->ctrl, next_ctrl);
+		WRITE_ONCE(q_desc->ctrl, q_ctrl & ~CL_DESC_OWN);
 		q->ack_idx = (q_idx + 1) & mask;
 	}
 
@@ -306,8 +304,10 @@ static bool pfe_hif_orphan_sync_client_queue(struct hif_client_tx_queue *q,
 /*
  * Drain contiguous completed orphaned descriptors from Txtoclean:
  * synchronizes client ring state first, unmaps DMA, releases skb once,
- * resets desc_sw to a clean reusable state, and advances Txtoclean / TxAvail
- * together. Returns the number of drained descriptors.
+ * resets desc_sw (setting client_id = HIF_CLIENTS_MAX and skb = NULL so
+ * any still-active hardware descriptors later reclaim safely without client
+ * state), and advances Txtoclean / TxAvail together. Returns the number of
+ * drained descriptors.
  */
 static unsigned int pfe_hif_drain_orphaned_tx(struct pfe_hif *hif,
 					      struct hif_client_tx_queue *q)
@@ -427,11 +427,10 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 /*
  * Detach remaining TX descriptors and skbs from a closing client queue using
  * CL_DESC_OWN as the single owner flag:
- *  - CL_DESC_OWN set: HIF owns desc_sw->skb (q_desc->data is NULL); marking
- *    desc_sw->client_id = HIF_CLIENTS_MAX keeps skb ownership solely with
- *    desc_sw until pfe_hif_drain_orphaned_tx() reclaims it.
- *  - CL_DESC_OWN clear: client ring owns q_desc->data (desc_sw->skb is
- *    NULL), so q_desc->data is freed once here.
+ *  - Any hardware-completed orphaned descriptors are drained first.
+ *  - For remaining pending client descriptors, if !(q_ctrl & CL_DESC_OWN) the
+ *    client ring owns q_desc->data so it is freed once here; if CL_DESC_OWN
+ *    is set, desc_sw owns the skb and will release it upon completion.
  */
 void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 			      struct hif_client_tx_queue *q)
