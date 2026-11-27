@@ -496,8 +496,7 @@ static void pfe_eth_rx_drain(struct pfe_eth_priv_s *priv, unsigned int qno)
 		else
 			skb_checksum_none_assert(skb);
 
-		dev->stats.rx_packets++;
-		dev->stats.rx_bytes += length;
+		dev_sw_netstats_rx_add(dev, length);
 
 		napi_gro_receive(&priv->pfe->hif.napi, skb);
 	}
@@ -830,8 +829,7 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 		return NETDEV_TX_OK;
 	}
 
-	dev->stats.tx_packets++;
-	dev->stats.tx_bytes += pkt_len;
+	dev_sw_netstats_tx_add(dev, 1, pkt_len);
 	if (nr_frag_segs) {
 		priv->sw_stats.tx_sg_pkts++;
 		priv->sw_stats.tx_sg_frags += nr_frag_segs;
@@ -1083,7 +1081,7 @@ static void pfe_eth_extphy_clk_release(void *data)
 	clk_put(clk);
 }
 
-static char pfe_boot_mac_param[18];
+static char pfe_boot_mac_param[64];
 static u8 pfe_boot_mac_addr[ETH_ALEN];
 static bool pfe_boot_mac_addr_valid;
 
@@ -1102,7 +1100,7 @@ static void pfe_parse_mac_param(void)
 }
 
 module_param_string(mac_addr, pfe_boot_mac_param, sizeof(pfe_boot_mac_param), 0444);
-MODULE_PARM_DESC(mac_addr, "Initial MAC address for GEM0");
+MODULE_PARM_DESC(mac_addr, "Comma-separated initial MAC addresses for GEM ports");
 
 static int pfe_eth_probe_gem0(struct pfe *pfe, struct device_node *np)
 {
@@ -1143,6 +1141,7 @@ static int pfe_eth_probe_gem0(struct pfe *pfe, struct device_node *np)
 	dev->min_mtu = ETH_MIN_MTU;
 	dev->max_mtu = ETH_DATA_LEN;
 	dev->needed_headroom = sizeof(struct hif_hdr);
+	dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
 
 	dev->hw_features = NETIF_F_RXCSUM | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			    NETIF_F_SG;

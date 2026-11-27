@@ -153,8 +153,10 @@ struct hif_tso_hdr {
 #define HIF_CTRL_RX_CONTINUED	(1 << 1)
 #define HIF_CTRL_VAPID_OFST	8
 
-/* Lock hierarchy: tx_clean_lock (pfe_eth) -> hif->tx_lock (BH);
- * hif->irq_lock is a leaf lock guarding HIF_INT_ENABLE and tx_irq_clients.
+/* Lock hierarchy:
+ *  - tx_clean_lock (pfe_eth) -> hif->tx_lock (BH)
+ *  - hif->lock -> hif->tx_lock (BH)
+ *  - hif->irq_lock is a leaf lock guarding HIF_INT_ENABLE and tx_irq_clients.
  */
 struct pfe_hif {
 	struct hif_client client[HIF_CLIENTS_MAX];
