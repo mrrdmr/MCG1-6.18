@@ -255,9 +255,25 @@ static void hif_lib_client_release_tx_buffers(struct hif_client_s *client)
 		return;
 
 	for (qno = 0; qno < client->tx_qn; qno++) {
-		if (client->tx_q[qno].tx_pending)
-			pr_err("%s: client %d queue %d has pending tx packets\n",
-			       __func__, client->id, qno);
+		struct hif_client_tx_queue *q = &client->tx_q[qno];
+
+		if (q->tx_pending) {
+			pr_err("%s: client %d queue %d has %u pending tx descriptors\n",
+			       __func__, client->id, qno, q->tx_pending);
+			while (q->tx_pending) {
+				struct tx_queue_desc *q_desc = q->base + q->read_idx;
+				u32 q_ctrl = READ_ONCE(q_desc->ctrl);
+				void *data = q_desc->data;
+
+				q_desc->data = NULL;
+				WRITE_ONCE(q_desc->ctrl, 0);
+				q->read_idx = (q->read_idx + 1) & (q->size - 1);
+				q->tx_pending--;
+
+				if (!(q_ctrl & CL_DESC_OWN) && data)
+					dev_kfree_skb_any(data);
+			}
+		}
 	}
 
 	kfree(client->tx_qbase);
@@ -372,8 +388,9 @@ unsigned int hif_lib_tx_avail(struct hif_client_s *client, unsigned int qno)
 /*
  * Prepend the HIF header onto head_data, DMA-map the linear head, and
  * enqueue the head plus pre-mapped scatter-gather segments into the client
- * and HIF TX rings under hif->tx_lock with BQL accounting. Only the final
- * descriptor carries client_data (skb) and HIF_DATA_VALID.
+ * and HIF TX rings under hif->tx_lock with BQL accounting. While CL_DESC_OWN
+ * is set, HIF owns client_data (skb) on the final desc_sw and transfers it
+ * to desc->data upon completion ack.
  */
 int hif_lib_xmit_pkt_sg(struct hif_client_s *client, unsigned int qno,
 			void *head_data, unsigned int head_len,
@@ -441,7 +458,7 @@ int hif_lib_xmit_pkt_sg(struct hif_client_s *client, unsigned int qno,
 		segs[i].q_idx = cur;
 		segs[i].skb = is_last ? client_data : NULL;
 
-		desc->data = is_last ? client_data : NULL;
+		desc->data = NULL;
 		WRITE_ONCE(desc->ctrl, CL_DESC_OWN | CL_DESC_FLAGS(desc_flags));
 	}
 
@@ -472,12 +489,19 @@ int hif_lib_xmit_pkt_sg(struct hif_client_s *client, unsigned int qno,
 	return 0;
 }
 
+/*
+ * Atomically dequeue one complete packet chain (HIF_FIRST_BUFFER through
+ * HIF_LAST_BUFFER | HIF_DATA_VALID) only after every descriptor in the
+ * packet has completed hardware DMA (!(ctrl & CL_DESC_OWN)) and unmapped.
+ */
 void *hif_lib_tx_get_next_complete(struct hif_client_s *client, int qno,
 				    unsigned int *flags, int count)
 {
 	struct hif_client_tx_queue *queue;
 	struct pfe_hif *hif;
 	bool polled_hw = false;
+	u32 max_scan, step;
+	void *pkt_skb = NULL;
 
 	if (unlikely(!client || !client->pfe || qno < 0 || qno >= client->tx_qn))
 		return NULL;
@@ -490,8 +514,16 @@ void *hif_lib_tx_get_next_complete(struct hif_client_s *client, int qno,
 
 	spin_lock_bh(&hif->tx_lock);
 
-	while (queue->tx_pending > 0) {
-		struct tx_queue_desc *desc = queue->base + queue->read_idx;
+	if (!queue->tx_pending) {
+		spin_unlock_bh(&hif->tx_lock);
+		return NULL;
+	}
+
+	max_scan = min_t(u32, queue->tx_pending, PFE_TX_MAX_SG_DESCS);
+
+	for (step = 0; step < max_scan; step++) {
+		unsigned int cur = (queue->read_idx + step) & (queue->size - 1);
+		struct tx_queue_desc *desc = queue->base + cur;
 		u32 q_ctrl = READ_ONCE(desc->ctrl);
 		u32 desc_flags;
 		void *data;
@@ -507,33 +539,67 @@ void *hif_lib_tx_get_next_complete(struct hif_client_s *client, int qno,
 				break;
 		}
 
+		/* Pairs with smp_wmb() in client_ack_txpacket(). */
+		smp_rmb();
+
 		desc_flags = CL_DESC_GET_FLAGS(q_ctrl);
 		data = desc->data;
-		desc->data = NULL;
-		WRITE_ONCE(desc->ctrl, 0);
-		queue->read_idx = (queue->read_idx + 1) & (queue->size - 1);
-		queue->tx_pending--;
 
-		/*
-		 * Only report packet completion on the final descriptor
-		 * (HIF_LAST_BUFFER + HIF_DATA_VALID) with a valid skb;
-		 * non-final or partial descriptors must be retired first so
-		 * all SG DMA mappings and client slots are complete.
-		 */
-		if ((desc_flags & (HIF_LAST_BUFFER | HIF_DATA_VALID)) ==
-		    (HIF_LAST_BUFFER | HIF_DATA_VALID) && data) {
-			*flags = HIF_DATA_VALID;
+		if (step == 0 && unlikely(!(desc_flags & HIF_FIRST_BUFFER))) {
+			dev_err_ratelimited(hif->dev,
+					    "%s: client %d q %d idx %u missing HIF_FIRST_BUFFER (ctrl=%#x)\n",
+					    __func__, client->id, qno, cur, q_ctrl);
 			spin_unlock_bh(&hif->tx_lock);
-			return data;
+			return NULL;
 		}
 
-		if (unlikely(data))
-			dev_kfree_skb_any(data);
+		if (step > 0 && unlikely(desc_flags & HIF_FIRST_BUFFER)) {
+			dev_err_ratelimited(hif->dev,
+					    "%s: client %d q %d idx %u unexpected HIF_FIRST_BUFFER mid-chain (ctrl=%#x)\n",
+					    __func__, client->id, qno, cur, q_ctrl);
+			spin_unlock_bh(&hif->tx_lock);
+			return NULL;
+		}
+
+		if (desc_flags & HIF_LAST_BUFFER) {
+			unsigned int chain_len = step + 1;
+			unsigned int k;
+
+			if (unlikely(!(desc_flags & HIF_DATA_VALID) || !data)) {
+				dev_err_ratelimited(hif->dev,
+						    "%s: client %d q %d idx %u malformed final desc (ctrl=%#x data=%p)\n",
+						    __func__, client->id, qno, cur, q_ctrl, data);
+				spin_unlock_bh(&hif->tx_lock);
+				return NULL;
+			}
+
+			for (k = 0; k < chain_len; k++) {
+				unsigned int idx = (queue->read_idx + k) & (queue->size - 1);
+				struct tx_queue_desc *retire_desc = queue->base + idx;
+
+				retire_desc->data = NULL;
+				WRITE_ONCE(retire_desc->ctrl, 0);
+			}
+
+			queue->read_idx = (queue->read_idx + chain_len) & (queue->size - 1);
+			queue->tx_pending -= chain_len;
+			pkt_skb = data;
+			*flags = HIF_DATA_VALID;
+			break;
+		}
+
+		if (unlikely((desc_flags & HIF_DATA_VALID) || data)) {
+			dev_err_ratelimited(hif->dev,
+					    "%s: client %d q %d idx %u unexpected data on non-final desc (ctrl=%#x data=%p)\n",
+					    __func__, client->id, qno, cur, q_ctrl, data);
+			spin_unlock_bh(&hif->tx_lock);
+			return NULL;
+		}
 	}
 
 	spin_unlock_bh(&hif->tx_lock);
 
-	return NULL;
+	return pkt_skb;
 }
 
 void *hif_lib_receive_pkt(struct hif_client_s *client, int qno, int *len, int *ofst,

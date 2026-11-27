@@ -44,6 +44,7 @@
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/lockdep.h>
+#include <linux/log2.h>
 #include <linux/skbuff.h>
 #include <linux/string.h>
 
@@ -139,8 +140,9 @@ static void pfe_hif_release_buffers(struct pfe_hif *hif)
 		desc = hif->TxBase;
 		for (i = 0; i < hif->TxRingSize; i++) {
 			struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[i];
-			struct sk_buff *skb = xchg(&desc_sw->skb, NULL);
+			struct sk_buff *skb = desc_sw->skb;
 
+			desc_sw->skb = NULL;
 			pfe_hif_unmap_tx_desc(hif, desc_sw);
 			if (unlikely(skb))
 				dev_kfree_skb_any(skb);
@@ -294,6 +296,7 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 		hif->shm->gClient_status &= ~(1 << client_id);
 		memset(&hif->client[client_id], 0, sizeof(hif->client[client_id]));
 		pfe_hif_mark_client_orphaned(hif, client_id);
+		__hif_tx_done_process(hif, hif->TxRingSize);
 	}
 
 	spin_unlock_bh(&hif->tx_lock);
@@ -304,15 +307,16 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 
 /*
  * Detach remaining in-flight TX descriptors and skbs from a closing client
- * queue so late TX completions release DMA/skb resources safely without
- * referencing a reopened client session. Each skb has a single release owner:
- * either freed immediately here or left on desc_sw->skb for late TX completion.
+ * queue using CL_DESC_OWN as the single owner flag:
+ *  - CL_DESC_OWN set: HIF owns desc_sw->skb (q_desc->data is NULL); marking
+ *    desc_sw->client_id = HIF_CLIENTS_MAX transfers ownership to the orphan
+ *    completion path before clearing the client ring.
+ *  - CL_DESC_OWN clear: client ring owns q_desc->data (desc_sw->skb was
+ *    already cleared on ack), so q_desc->data is freed here.
  */
 void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 			      struct hif_client_tx_queue *q)
 {
-	unsigned int active, i;
-
 	lockdep_assert_held(&hif->tx_lock);
 
 	if (unlikely(!q || !q->base))
@@ -320,66 +324,21 @@ void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 
 	pfe_hif_mark_client_orphaned(hif, client_id);
 
-	active = hif->TxRingSize - hif->TxAvail;
-	for (i = 0; i < active; i++) {
-		unsigned int cur = (hif->Txtoclean + i) & (hif->TxRingSize - 1);
-		struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[cur];
-		struct sk_buff *skb = desc_sw->skb;
-
-		if (!skb || desc_sw->client_id != HIF_CLIENTS_MAX)
-			continue;
-
-		if (desc_sw->q_no < HIF_CLIENT_QUEUES_MAX &&
-		    desc_sw->q_idx < q->size) {
-			struct tx_queue_desc *q_desc = q->base + desc_sw->q_idx;
-
-			if (q_desc->data == skb) {
-				q_desc->data = NULL;
-				WRITE_ONCE(q_desc->ctrl,
-					     READ_ONCE(q_desc->ctrl) & ~CL_DESC_OWN);
-			}
-		}
-
-		/*
-		 * Leave skb on desc_sw->skb only while the hardware descriptor
-		 * is still enabled so late TX completion frees it once; if
-		 * hardware has already completed it, take ownership now.
-		 */
-		if (!(READ_ONCE(hif->TxBase[cur].ctrl) & BD_CTRL_DESC_EN)) {
-			skb = xchg(&desc_sw->skb, NULL);
-			if (skb)
-				dev_kfree_skb_any(skb);
-		}
-	}
-
 	while (q->tx_pending) {
 		struct tx_queue_desc *q_desc = q->base + q->read_idx;
-		struct sk_buff *skb = q_desc->data;
 		u32 q_ctrl = READ_ONCE(q_desc->ctrl);
-
-		if (skb && (CL_DESC_GET_FLAGS(q_ctrl) & HIF_DATA_VALID)) {
-			unsigned int k;
-			bool owned_in_flight = false;
-
-			for (k = 0; k < active; k++) {
-				unsigned int cur = (hif->Txtoclean + k) &
-						   (hif->TxRingSize - 1);
-
-				if (hif->tx_sw_queue[cur].skb == skb) {
-					owned_in_flight = true;
-					break;
-				}
-			}
-
-			if (!owned_in_flight)
-				dev_kfree_skb_any(skb);
-		}
+		struct sk_buff *skb = q_desc->data;
 
 		q_desc->data = NULL;
 		WRITE_ONCE(q_desc->ctrl, 0);
 		q->read_idx = (q->read_idx + 1) & (q->size - 1);
 		q->tx_pending--;
+
+		if (!(q_ctrl & CL_DESC_OWN) && skb)
+			dev_kfree_skb_any(skb);
 	}
+
+	__hif_tx_done_process(hif, hif->TxRingSize);
 }
 
 /*
@@ -628,28 +587,38 @@ pkt_drop:
 	return remap_stalled ? budget : rx_processed;
 }
 
+/*
+ * Validate client TX descriptor position and ownership before transferring
+ * skb ownership from HIF (desc_sw->skb, CL_DESC_OWN set) to the client ring
+ * (desc->data, CL_DESC_OWN clear). On validation failure, leaves client and
+ * hardware ownership untouched and returns an error.
+ */
 static int client_ack_txpacket(struct pfe_hif *hif, unsigned int client_id,
 			       unsigned int q_no, unsigned int q_idx,
-			       struct sk_buff *expected_skb)
+			       struct sk_buff *skb)
 {
 	struct hif_tx_queue *queue;
 	struct tx_queue_desc *desc;
-	u32 q_ctrl;
+	u32 q_ctrl, desc_flags;
 
 	if (unlikely(client_id >= HIF_CLIENTS_MAX ||
 		     !(hif->shm->gClient_status & (1 << client_id)) ||
-		     q_no >= hif->client[client_id].tx_qn))
-		return 0;
+		     q_no >= hif->client[client_id].tx_qn)) {
+		dev_err_ratelimited(hif->dev,
+				    "%s: invalid client %u or q %u\n",
+				    __func__, client_id, q_no);
+		return -EINVAL;
+	}
 
 	queue = &hif->client[client_id].tx_q[q_no];
 	if (unlikely(!queue->base || !queue->size ||
-		     !is_power_of_2(queue->size) || q_idx >= queue->size))
+		     !is_power_of_2(queue->size) || q_idx >= queue->size)) {
+		dev_err_ratelimited(hif->dev,
+				    "%s: invalid queue state for client %u q %u idx %u\n",
+				    __func__, client_id, q_no, q_idx);
 		return -EINVAL;
+	}
 
-	/*
-	 * Require q_idx to match the expected head of the unacked client ring
-	 * so stale or wrapped indices cannot clear the wrong descriptor.
-	 */
 	if (unlikely(queue->ack_idx != q_idx)) {
 		dev_err_ratelimited(hif->dev,
 				    "%s: stale/out-of-order q_idx %u (expected ack_idx %u) for client %u q %u\n",
@@ -660,23 +629,34 @@ static int client_ack_txpacket(struct pfe_hif *hif, unsigned int client_id,
 	desc = queue->base + q_idx;
 	q_ctrl = READ_ONCE(desc->ctrl);
 
-	if (!(q_ctrl & CL_DESC_OWN)) {
-		dev_err(hif->dev, "%s: unexpected: %d %d %d %d %d %p %u (ack=%u)\n",
-			__func__, hif->Txtosend, hif->Txtoclean, hif->TxAvail,
-			client_id, q_no, queue, q_idx, queue->ack_idx);
+	if (unlikely(!(q_ctrl & CL_DESC_OWN))) {
+		dev_err_ratelimited(hif->dev,
+				    "%s: client %u q %u idx %u not owned by HIF (ctrl=%#x)\n",
+				    __func__, client_id, q_no, q_idx, q_ctrl);
 		return -EINVAL;
 	}
 
-	if (expected_skb) {
-		if (unlikely(!(CL_DESC_GET_FLAGS(q_ctrl) & HIF_DATA_VALID) ||
-			     desc->data != expected_skb)) {
+	desc_flags = CL_DESC_GET_FLAGS(q_ctrl);
+	if (skb) {
+		if (unlikely((desc_flags & (HIF_LAST_BUFFER | HIF_DATA_VALID)) !=
+			     (HIF_LAST_BUFFER | HIF_DATA_VALID) || desc->data)) {
 			dev_err_ratelimited(hif->dev,
-					    "%s: client %u q %u q_idx %u skb mismatch (ctrl=%#x)\n",
-					    __func__, client_id, q_no, q_idx, q_ctrl);
+					    "%s: client %u q %u idx %u final desc mismatch (ctrl=%#x data=%p)\n",
+					    __func__, client_id, q_no, q_idx, q_ctrl, desc->data);
+			return -EILSEQ;
+		}
+	} else {
+		if (unlikely((desc_flags & (HIF_LAST_BUFFER | HIF_DATA_VALID)) ||
+			     desc->data)) {
+			dev_err_ratelimited(hif->dev,
+					    "%s: client %u q %u idx %u non-final desc mismatch (ctrl=%#x data=%p)\n",
+					    __func__, client_id, q_no, q_idx, q_ctrl, desc->data);
 			return -EILSEQ;
 		}
 	}
 
+	desc->data = skb;
+	smp_wmb();
 	WRITE_ONCE(desc->ctrl, q_ctrl & ~CL_DESC_OWN);
 	queue->ack_idx = (q_idx + 1) & (queue->size - 1);
 
@@ -702,18 +682,20 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 		dma_rmb();
 
 		desc_sw = &hif->tx_sw_queue[ttc];
-		skb = xchg(&desc_sw->skb, NULL);
-		pfe_hif_unmap_tx_desc(hif, desc_sw);
+		skb = desc_sw->skb;
 
 		if (desc_sw->client_id < HIF_CLIENTS_MAX) {
 			if (client_ack_txpacket(hif, desc_sw->client_id,
 						desc_sw->q_no, desc_sw->q_idx,
-						skb) && skb) {
-				dev_kfree_skb_any(skb);
-			}
+						skb))
+				break;
+			desc_sw->skb = NULL;
 		} else if (unlikely(skb)) {
+			desc_sw->skb = NULL;
 			dev_kfree_skb_any(skb);
 		}
+
+		pfe_hif_unmap_tx_desc(hif, desc_sw);
 
 		inc_hif_txidx(ttc);
 		tx_avl++;
