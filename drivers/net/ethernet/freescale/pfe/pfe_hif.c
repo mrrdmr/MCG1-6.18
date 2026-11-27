@@ -239,6 +239,42 @@ static void pfe_hif_mark_client_orphaned(struct pfe_hif *hif, unsigned int clien
 	}
 }
 
+/*
+ * Single-pass teardown helper for HIF descriptors orphaned from a client:
+ * unmaps DMA and releases skb once for completed orphaned entries whose
+ * ownership has already transferred from hardware to HIF.
+ */
+static void pfe_hif_drain_orphaned_tx(struct pfe_hif *hif)
+{
+	unsigned int active = hif->TxRingSize - hif->TxAvail;
+	unsigned int i;
+
+	lockdep_assert_held(&hif->tx_lock);
+
+	for (i = 0; i < active; i++) {
+		unsigned int cur = (hif->Txtoclean + i) & (hif->TxRingSize - 1);
+		struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[cur];
+		struct hif_desc *desc = hif->TxBase + cur;
+
+		if (desc_sw->client_id != HIF_CLIENTS_MAX)
+			continue;
+
+		if (READ_ONCE(desc->ctrl) & BD_CTRL_DESC_EN)
+			continue;
+
+		dma_rmb();
+
+		if (desc_sw->skb) {
+			struct sk_buff *skb = desc_sw->skb;
+
+			desc_sw->skb = NULL;
+			dev_kfree_skb_any(skb);
+		}
+
+		pfe_hif_unmap_tx_desc(hif, desc_sw);
+	}
+}
+
 static int pfe_hif_client_register(struct pfe_hif *hif, u32 client_id,
 				    struct hif_client_shm *client_shm)
 {
@@ -296,7 +332,7 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 		hif->shm->gClient_status &= ~(1 << client_id);
 		memset(&hif->client[client_id], 0, sizeof(hif->client[client_id]));
 		pfe_hif_mark_client_orphaned(hif, client_id);
-		__hif_tx_done_process(hif, hif->TxRingSize);
+		pfe_hif_drain_orphaned_tx(hif);
 	}
 
 	spin_unlock_bh(&hif->tx_lock);
@@ -306,11 +342,11 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 }
 
 /*
- * Detach remaining in-flight TX descriptors and skbs from a closing client
- * queue using CL_DESC_OWN as the single owner flag:
+ * Detach remaining TX descriptors and skbs from a closing client queue using
+ * CL_DESC_OWN as the single owner flag:
  *  - CL_DESC_OWN set: HIF owns desc_sw->skb (q_desc->data is NULL); marking
- *    desc_sw->client_id = HIF_CLIENTS_MAX transfers ownership to the orphan
- *    completion path before clearing the client ring.
+ *    desc_sw->client_id = HIF_CLIENTS_MAX transfers ownership to the single
+ *    orphan drain pass.
  *  - CL_DESC_OWN clear: client ring owns q_desc->data (desc_sw->skb was
  *    already cleared on ack), so q_desc->data is freed here.
  */
@@ -337,8 +373,6 @@ void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 		if (!(q_ctrl & CL_DESC_OWN) && skb)
 			dev_kfree_skb_any(skb);
 	}
-
-	__hif_tx_done_process(hif, hif->TxRingSize);
 }
 
 /*
@@ -416,7 +450,7 @@ static bool pfe_hif_rx_arm_desc(struct pfe_hif *hif, int rtc, void *buf)
  * Dequeues HIF Rx descriptors and hands completed packets to the owning
  * client's Rx queue. NAPI poll function.
  */
-static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
+static int pfe_hif_rx_process(struct pfe_hif *hif, int budget, bool *remap_stalled_out)
 {
 	struct hif_hdr pkt_hdr;
 	void *pkt_hdr_ptr;
@@ -427,6 +461,8 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 	struct hif_desc *desc;
 	u32 ctrl;
 	int flags;
+
+	*remap_stalled_out = false;
 
 	spin_lock_bh(&hif->lock);
 
@@ -581,8 +617,9 @@ pkt_drop:
 	hif->RxtocleanIndex = rtc;
 	spin_unlock_bh(&hif->lock);
 
-	/* We made progress; re-start Rx DMA in case it stopped. */
-	hif_rx_dma_start();
+	*remap_stalled_out = remap_stalled;
+	if (!remap_stalled)
+		hif_rx_dma_start();
 
 	return remap_stalled ? budget : rx_processed;
 }
@@ -683,15 +720,15 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 
 		desc_sw = &hif->tx_sw_queue[ttc];
 		skb = desc_sw->skb;
+		desc_sw->skb = NULL;
 
 		if (desc_sw->client_id < HIF_CLIENTS_MAX) {
 			if (client_ack_txpacket(hif, desc_sw->client_id,
 						desc_sw->q_no, desc_sw->q_idx,
-						skb))
-				break;
-			desc_sw->skb = NULL;
+						skb) && skb) {
+				dev_kfree_skb_any(skb);
+			}
 		} else if (unlikely(skb)) {
-			desc_sw->skb = NULL;
 			dev_kfree_skb_any(skb);
 		}
 
@@ -893,14 +930,17 @@ static void pfe_hif_tx_poll_notify(struct pfe_hif *hif)
 static int pfe_hif_rx_poll(struct napi_struct *napi, int budget)
 {
 	struct pfe_hif *hif = container_of(napi, struct pfe_hif, napi);
+	bool remap_stalled = false;
 	int work_done;
 
 	hif->napi_counters[NAPI_POLL_COUNT]++;
 
-	work_done = pfe_hif_rx_process(hif, budget);
+	work_done = pfe_hif_rx_process(hif, budget, &remap_stalled);
 	pfe_hif_tx_poll_notify(hif);
 
-	if (work_done < budget) {
+	if (remap_stalled) {
+		hif->napi_counters[NAPI_REMAP_STALLED_COUNT]++;
+	} else if (work_done < budget) {
 		unsigned long flags;
 
 		spin_lock_irqsave(&hif->irq_lock, flags);
