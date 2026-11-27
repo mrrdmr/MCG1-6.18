@@ -254,30 +254,73 @@ static void pfe_hif_mark_client_orphaned(struct pfe_hif *hif, unsigned int clien
 }
 
 /*
- * Check whether client descriptor q_idx has a completed orphaned descriptor
- * in hif->tx_sw_queue (still active in HIF ring and no longer owned by HW).
+ * Check whether an entire SG packet chain starting at q_idx is present in
+ * the active HIF TX window and completely finished by hardware:
+ *  - Every descriptor from start_hw through the BD_CTRL_LIFM descriptor of
+ *    that same packet chain must have client_id == HIF_CLIENTS_MAX, match
+ *    the packet's q_no and sequential q_idx values, and have
+ *    BD_CTRL_DESC_EN cleared.
+ * Returns true if the full packet chain is completed (or if no active HIF
+ * entry matches q_idx), or false if any descriptor in the chain is missing
+ * or still owned by hardware.
  */
-static bool pfe_hif_orphan_desc_done(struct pfe_hif *hif, unsigned int q_idx)
+static bool pfe_hif_orphan_chain_done(struct pfe_hif *hif,
+				      const struct hif_client_tx_queue *q,
+				      unsigned int start_q_idx,
+				      unsigned int chain_len)
 {
 	unsigned int active = hif->TxRingSize - hif->TxAvail;
+	unsigned int mask = q->size - 1;
 	unsigned int i;
 
 	for (i = 0; i < active; i++) {
 		unsigned int hw_idx = (hif->Txtoclean + i) & (hif->TxRingSize - 1);
 		struct hif_desc_sw *sw = &hif->tx_sw_queue[hw_idx];
 		struct hif_desc *hw = hif->TxBase + hw_idx;
+		unsigned int q_no, step;
+		bool found_lifm = false;
 
-		if (sw->client_id == HIF_CLIENTS_MAX && sw->q_idx == q_idx)
-			return !(READ_ONCE(hw->ctrl) & BD_CTRL_DESC_EN);
+		if (sw->client_id != HIF_CLIENTS_MAX || sw->q_idx != start_q_idx)
+			continue;
+
+		if (i + chain_len > active)
+			return false;
+
+		q_no = sw->q_no;
+		for (step = 0; step < chain_len; step++) {
+			unsigned int c_hw_idx = (hw_idx + step) & (hif->TxRingSize - 1);
+			struct hif_desc_sw *c_sw = &hif->tx_sw_queue[c_hw_idx];
+			struct hif_desc *c_hw = hif->TxBase + c_hw_idx;
+			u32 c_ctrl = READ_ONCE(c_hw->ctrl);
+			unsigned int exp_q_idx = (start_q_idx + step) & mask;
+
+			if (c_sw->client_id != HIF_CLIENTS_MAX ||
+			    c_sw->q_no != q_no ||
+			    c_sw->q_idx != exp_q_idx)
+				return false;
+
+			if (c_ctrl & BD_CTRL_DESC_EN)
+				return false;
+
+			if (c_ctrl & BD_CTRL_LIFM) {
+				if (step + 1 != chain_len)
+					return false;
+				found_lifm = true;
+			} else if (step + 1 == chain_len) {
+				return false;
+			}
+		}
+
+		return found_lifm;
 	}
 
-	/* Already drained past Txtoclean if q_idx was earlier in an active chain. */
 	return true;
 }
 
 /*
  * Validate every descriptor in the full SG chain from q->read_idx through
- * the HIF_LAST_BUFFER descriptor before changing ack_idx, read_idx, or
+ * the HIF_LAST_BUFFER descriptor—and verify that every HIF descriptor in
+ * that same packet chain is completed—before changing ack_idx, read_idx, or
  * tx_pending.
  */
 static void pfe_hif_orphan_sync_client_queue(struct pfe_hif *hif,
@@ -305,9 +348,6 @@ static void pfe_hif_orphan_sync_client_queue(struct pfe_hif *hif,
 		if (step > 0 && (desc_flags & HIF_FIRST_BUFFER))
 			return;
 
-		if (!pfe_hif_orphan_desc_done(hif, q_idx))
-			return;
-
 		if (desc_flags & HIF_LAST_BUFFER) {
 			if (step + 1 > PFE_TX_MAX_SG_DESCS ||
 			    !(desc_flags & HIF_DATA_VALID))
@@ -323,6 +363,9 @@ static void pfe_hif_orphan_sync_client_queue(struct pfe_hif *hif,
 	}
 
 	if (!found_last || !chain_len)
+		return;
+
+	if (!pfe_hif_orphan_chain_done(hif, q, q->read_idx, chain_len))
 		return;
 
 	for (step = 0; step < chain_len; step++) {
@@ -1183,4 +1226,3 @@ void pfe_hif_exit(struct pfe *pfe)
 	pfe_hif_release_buffers(hif);
 	pfe_hif_free_descr(hif);
 }
-```[cite: 2]
