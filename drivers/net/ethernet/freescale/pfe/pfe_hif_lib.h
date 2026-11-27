@@ -130,6 +130,20 @@ struct tx_queue_desc {
 extern unsigned int pfe_pkt_size;
 extern unsigned int pfe_pkt_headroom;
 
+/*
+ * Zero-copy Rx: buffers are ordinary cached page fragments
+ * (netdev_alloc_frag_align(), 128-byte aligned so the metadata word at
+ * base[0] and the DMA region at base + PFE_PKT_HEADROOM never share a
+ * cache line) and go through the streaming DMA API: pfe_hif_buf_map()
+ * when posted to the HIF ring, pfe_hif_buf_unmap() when the descriptor
+ * completes, before the CPU touches the data. Once received, the whole
+ * fragment is handed to the stack with build_skb() (pfe_eth.c) and freed
+ * by skb_free_frag() on the way out -- the same lifecycle every mainline
+ * page-fragment Rx path uses.
+ *
+ * The dma_addr_t of the current mapping is stashed in the buffer's own
+ * headroom so it travels alongside the plain "void *" pointer.
+ */
 #define PFE_BUF_ALIGN		128U
 
 /* Allocate a 2048-byte page fragment and return the packet data pointer
@@ -195,6 +209,15 @@ static inline void pfe_hif_buf_unmap(struct device *dev, void *pkt)
 	}
 }
 
+/*
+ * Pool of HIF_RX_DESC_NT spare buffers pre-allocated via GFP_KERNEL in
+ * pfe_hif_lib_init() and recycled via plain array push/pop, keeping page-
+ * fragment allocator calls off the hot RX path in the steady state (with
+ * a netdev_alloc_frag_align() GFP_ATOMIC fallback in client_put_rxpacket()
+ * if the spare pool ever drains). Sized at HIF_RX_DESC_NT because the
+ * drain runs synchronously inside the HIF NAPI poll, so at most a small
+ * number of buffers are in flight between HIF dequeue and build_skb().
+ */
 void *pfe_hif_spare_buf_get(void);
 void pfe_hif_spare_buf_put(void *buf);
 
@@ -202,6 +225,11 @@ int pfe_hif_lib_init(struct pfe *pfe);
 void pfe_hif_lib_exit(struct pfe *pfe);
 void hif_lib_indicate_client(int cl_id, int event, int data);
 
+/*
+ * Client registration API (Stage P7) -- lets a net_device driver
+ * (pfe_eth.c) hand the HIF driver its Rx/Tx shared-memory queues and
+ * become reachable via hif_lib_indicate_client() above.
+ */
 int hif_lib_client_register(struct hif_client_s *client);
 int hif_lib_client_unregister(struct hif_client_s *client);
 int hif_lib_tmu_queue_start(struct hif_client_s *client, int qno);
@@ -221,9 +249,32 @@ int hif_lib_xmit_pkt_sg(struct hif_client_s *client, unsigned int qno,
 void *hif_lib_tx_get_next_complete(struct hif_client_s *client, int qno,
 				    unsigned int *flags, int count);
 
+/*
+ * Dequeues one received packet's buffer (Stage P8). *ofst is the byte
+ * offset from the start of that buffer where the actual payload begins
+ * (past the hif_hdr, and past an optional firmware-prepended private
+ * header whose size is packed into the top byte of *rx_ctrl -- this
+ * port never sets that up on the Tx side, so it should always read 0
+ * for anything this driver itself sends, but a packet ingested straight
+ * off the wire goes through the same CLASS PE code path regardless, so
+ * the offset math is kept general rather than assumed away). *priv_data
+ * points at that private header if present, NULL otherwise -- unused by
+ * this port (no consumer for it), kept only because getting *ofst right
+ * depends on computing it.
+ */
 void *hif_lib_receive_pkt(struct hif_client_s *client, int qno, int *len, int *ofst,
 			   unsigned int *rx_ctrl, unsigned int *desc_ctrl, void **priv_data);
 
+/*
+ * Rx re-arm (Stage P8) -- call after draining a client's Rx queue for
+ * the given (event, qno) pair in response to hif_lib_indicate_client()
+ * calling this client's event_handler. hif_lib_indicate_client() is
+ * edge-triggered (queue_mask[] latches once until cleared here), so
+ * skipping this call would mean this queue never gets indicated again.
+ * Also re-checks for a packet that arrived during the drain (a race
+ * between "queue looked empty" and "mask cleared") and re-indicates
+ * immediately if so, rather than risking a missed wakeup.
+ */
 int hif_lib_event_handler_start(struct hif_client_s *client, int event, int qno);
 
 #endif /* _PFE_HIF_LIB_H_ */

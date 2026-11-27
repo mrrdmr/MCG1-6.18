@@ -48,6 +48,13 @@ struct pfe_eth_priv_s {
 	struct pfe *pfe;
 	struct hif_client_s client;
 
+	/* TMU Tx queue numbers this GEM's traffic is scheduled on -- only
+	 * ever passed to hif_lib_tmu_queue_start()/stop() (both no-ops,
+	 * see pfe_hif_lib.c), since this port's actual Tx submission
+	 * (hif_lib_xmit_pkt_sg(), Stage P8) always uses a single fixed
+	 * client-level queue (PFE_ETH_TXQ in pfe_eth.c) instead of the
+	 * vendor's per-packet QoS classification into one of 16.
+	 */
 	int low_tmuQ;
 	int high_tmuQ;
 
