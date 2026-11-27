@@ -51,6 +51,8 @@
 #include <linux/bitops.h>
 #include <linux/brcmphy.h>
 #include <linux/clk.h>
+#include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/ethtool.h>
 #include <linux/etherdevice.h>
 #include <linux/init.h>
@@ -61,30 +63,17 @@
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
 #include <linux/phy.h>
+#include <linux/skbuff.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
-
-#include <net/gso.h>
 
 #include "pfe_eth.h"
 #include "pfe_hw_lib.h"
 #include "pfe_mod.h"
 
-/* TMU queue numbers this GEM's traffic is scheduled on: TMU queues 0-5
- * are reserved for other PFE-internal traffic classes in the vendor
- * design; each GEM gets a low/high priority queue pair starting at 6.
- */
+#define PFE_GEM0_ID		0
 #define HIF_GEMAC_TMUQ_BASE	6
 
-/*
- * This SoC has exactly one PFE, and the MDIO management registers are
- * physically wired through GEM0/EMAC1's own register block regardless
- * of which GEM's PHY is being addressed (matches the vendor board file,
- * which only ever defines MDIO bus 0). Kept as file-static state for
- * the same reason g_pfe is (see pfe_mod.h) -- there's only ever one of
- * these on real hardware, and threading a pointer to it through every
- * per-GEM probe call for no benefit isn't worth it.
- */
 struct pfe_mdio_priv {
 	void __iomem *EMAC_baseaddr;
 	int mdc_div;
@@ -92,7 +81,7 @@ struct pfe_mdio_priv {
 
 static struct pfe_mdio_priv pfe_mdio_priv;
 static struct mii_bus *pfe_mii_bus;
-static struct net_device *pfe_gem_netdevs[3];
+static struct net_device *pfe_gem0_netdev;
 
 static int pfe_mdio_wait_idle(void __iomem *emac_base)
 {
@@ -110,8 +99,12 @@ static int pfe_mdio_wait_idle(void __iomem *emac_base)
 static int pfe_eth_mdio_read(struct mii_bus *bus, int mii_id, int regnum)
 {
 	struct pfe_mdio_priv *mpriv = bus->priv;
-	u32 write_data = 0x60020000 | (mii_id << 23) | (regnum << 18);
+	u32 write_data;
 
+	if (pfe_mdio_wait_idle(mpriv->EMAC_baseaddr))
+		return -ETIMEDOUT;
+
+	write_data = 0x60020000 | ((mii_id & 0x1F) << 23) | ((regnum & 0x1F) << 18);
 	writel(write_data, mpriv->EMAC_baseaddr + EMAC_PHY_MANAGEMENT);
 
 	if (pfe_mdio_wait_idle(mpriv->EMAC_baseaddr))
@@ -123,8 +116,12 @@ static int pfe_eth_mdio_read(struct mii_bus *bus, int mii_id, int regnum)
 static int pfe_eth_mdio_write(struct mii_bus *bus, int mii_id, int regnum, u16 value)
 {
 	struct pfe_mdio_priv *mpriv = bus->priv;
-	u32 write_data = 0x50020000 | (mii_id << 23) | (regnum << 18) | value;
+	u32 write_data;
 
+	if (pfe_mdio_wait_idle(mpriv->EMAC_baseaddr))
+		return -ETIMEDOUT;
+
+	write_data = 0x50020000 | ((mii_id & 0x1F) << 23) | ((regnum & 0x1F) << 18) | value;
 	writel(write_data, mpriv->EMAC_baseaddr + EMAC_PHY_MANAGEMENT);
 
 	return pfe_mdio_wait_idle(mpriv->EMAC_baseaddr);
@@ -148,16 +145,6 @@ static int pfe_eth_mdio_init(struct pfe *pfe, struct device_node *np)
 	int rc, addr;
 
 	pfe_mdio_priv.EMAC_baseaddr = EMAC1_BASE_ADDR;
-	/*
-	 * 96 is the only real data point found for this divisor: the GPL
-	 * source drop's arch/arm/mach-comcerto/board-c2kevm.c has this
-	 * exact value hand-edited into comcerto_mdio_pdata[0], alongside a
-	 * comment identifying a Broadcom PHY on this bus (see the P7
-	 * research writeup in the commit log) -- unconfirmed for this
-	 * specific board like the PHY address itself, but a real divisor
-	 * setting a wide margin under any PHY's max MDC frequency either
-	 * way, so it's a safe default regardless.
-	 */
 	pfe_mdio_priv.mdc_div = 96;
 
 	bus = mdiobus_alloc();
@@ -169,7 +156,7 @@ static int pfe_eth_mdio_init(struct pfe *pfe, struct device_node *np)
 	bus->write = pfe_eth_mdio_write;
 	bus->reset = pfe_eth_mdio_reset;
 	bus->priv = &pfe_mdio_priv;
-	bus->phy_mask = 0; /* scan every address -- see banner comment */
+	bus->phy_mask = 0;
 	bus->parent = pfe->dev;
 	snprintf(bus->id, MII_BUS_ID_SIZE, "ls1024a-pfe-mdio");
 
@@ -245,10 +232,7 @@ static void pfe_gemac_init(struct pfe_eth_priv_s *priv)
 	gemac_disable_fcs_rx(priv->EMAC_baseaddr);
 	gemac_enable_1536_rx(priv->EMAC_baseaddr);
 	gemac_set_bus_width(priv->EMAC_baseaddr, 64);
-	/* GEM verifies IPv4/TCP/UDP checksums; the class PE reports the
-	 * result as HIF_CTRL_RX_CHECKSUMMED in the per-packet client_ctrl
-	 * (see pfe_eth_rx_drain()).
-	 */
+
 	if (priv->dev->features & NETIF_F_RXCSUM)
 		gemac_enable_rx_checksum_offload(priv->EMAC_baseaddr);
 	else
@@ -308,78 +292,16 @@ static void pfe_eth_adjust_link(struct net_device *dev)
 	spin_unlock_irqrestore(&priv->lock, flags);
 }
 
-/*
- * Restores this PHY's LED-adjacent shadow registers to their vendor-
- * matching values -- found by diffing raw register reads against the
- * 3.2.26 vendor kernel on the same board. Two prior fixes already
- * cover other real differences the same way: PHY_BRCM_RX_REFCLK_UNUSED
- * (see pfe_phy_init() below) stops bcm54612e_config_init() from
- * diverting LED4 to a CLK125 clock output, and this function's own ECR
- * write undoes that same config_init()'s global interrupt/event mask
- * (0x1000 here vs 0x0 on the vendor kernel, which never touches it).
- *
- * LEDS1 (shadow 0x0d, LED1/LED3 -- the "Link" LED): the generic
- * Broadcom config_init() shared by every non-SFP chip this driver
- * matches (drivers/net/phy/broadcom.c, right after the switch on
- * phy_id) unconditionally reprograms this pin pair from its hardware-
- * strap default (BCM_LED_SRC_LINKSPD1/LINKSPD2, 0x10 -- matching the
- * vendor kernel exactly, which never touches this register at all)
- * into BCM_LED_SRC_MULTICOLOR1 (0xaa) plus a Multicolor expansion-
- * register LINK_ACT encoding -- its own comment there says this is
- * meant for a single physical bi-color LED sharing both pins. This
- * board instead has two separate single-color LEDs wired to LED1 and
- * LED3 (confirmed: the vendor kernel's LED is lit *steady*, matching a
- * plain link-speed indicator, not a blink-on-activity one), so forcing
- * the bi-color pairing breaks that. Restored to the vendor-matching
- * encoding here -- though on its own this wasn't sufficient to light
- * it; see the RGMII_MODE write below for what actually was.
- *
- * Caller must run this after pfe_eth_start()/phy_start(), not right
- * after connecting -- see the comment at its one call site in
- * pfe_eth_open() for why (phy_start() unconditionally resumes the PHY,
- * which re-runs config_init and undoes this otherwise).
- */
-/*
- * RGMII Mode Selector (shadow 0x0b) -- not one of mainline's named LED
- * registers, but this is the exact register the vendor's WD-specific
- * bcm54610_config_init() hack (shared by BCM54610/BCM54612 in that
- * tree) writes as a side effect of what its own comment describes as
- * "disable half-duplex" (the real half-duplex-disable part is two
- * separate writes to MII regs 4/9; this shadow-0x0b write is a third,
- * distinct action the same function performs that this port never
- * carried over -- dismissed early on as "not LED-related" based on the
- * register's generic name alone, without checking the actual value).
- * A full blind register sweep (every shadow reg 0x00-0x1f, every
- * expansion reg on the three pages any BCM54xx code in this driver
- * selects) diffed against the same sweep on the vendor kernel turned up
- * this as the one meaningful difference among them: this port reads
- * 0x009 here (hardware default, untouched) vs the vendor kernel's
- * 0x08c -- which exactly matches the DATA field the WD hack's own raw
- * MDIO writes encode (phy_write(0x1C, 0xAC8C) -- VAL=0x0b, DATA=0x08c).
- * BCM54XX_SHD_RGMII_MODE is a real, documented-elsewhere-in-mainline
- * register (bcm_phy_write_shadow(..., BCM54XX_SHD_RGMII_MODE, 0) is
- * used for BCM50610/BCM50610M under PHY_BRCM_CLEAR_RGMII_MODE), so this
- * genuinely configures something -- unlike TOP_MISC_LED_CTL, which a
- * previous round found reads back unchanged no matter what's written
- * (likely mostly reserved bits for this chip), this one is confirmed
- * writable and vendor-nonzero. Not otherwise explained yet, but it's
- * the most concrete remaining lead after every named LED-selector
- * register was matched or forced with zero effect.
- */
 #define PFE_PHY_SHD_RGMII_MODE_VENDOR_VAL	0x08c
 
+/*
+ * Restores this PHY's LED-adjacent shadow registers to their vendor-
+ * matching values. Must run after pfe_eth_start()/phy_start(), because
+ * phy_start() triggers resume -> config_init() which otherwise overwrites
+ * LEDS1 and ECR.IM.
+ */
 static void pfe_phy_restore_led_mode(struct phy_device *phydev)
 {
-	/*
-	 * LEDS1 (LED1/LED3, the "Link" LED): restored to the vendor-
-	 * matching hardware-default encoding (LINKSPD1/LINKSPD2 -- real
-	 * link-speed indication, not a blunt "always on"). Confirmed on
-	 * real hardware (putty.log.213) that the LED actually responds now
-	 * that RGMII_MODE (below) is also fixed -- earlier rounds tried
-	 * this same LEDS1 value (and a forced-all-on variant) without
-	 * RGMII_MODE fixed and got nothing, so RGMII_MODE was the real
-	 * missing piece, not LEDS1's content.
-	 */
 	u16 leds1 = BCM54XX_SHD_LEDS1_LED1(BCM_LED_SRC_LINKSPD1) |
 		    BCM54XX_SHD_LEDS1_LED3(BCM_LED_SRC_LINKSPD2);
 
@@ -387,38 +309,8 @@ static void pfe_phy_restore_led_mode(struct phy_device *phydev)
 		  MII_BCM54XX_SHD_WRITE | MII_BCM54XX_SHD_VAL(BCM54XX_SHD_LEDS1) |
 		  MII_BCM54XX_SHD_DATA(leds1));
 
-	/*
-	 * ECR.IM (global interrupt/event mask): confirmed real difference
-	 * vs. the vendor kernel (0x1000 here vs 0x0 there, neither kernel
-	 * ever using a real hardware IRQ line for this PHY either way --
-	 * see git log for the full writeup). Clear it to match; harmless.
-	 */
 	phy_write(phydev, MII_BCM54XX_ECR, phy_read(phydev, MII_BCM54XX_ECR) & ~MII_BCM54XX_ECR_IM);
 
-	/* LEDS2 (LED0/LED2, "ACT"): deliberately left untouched -- this one
-	 * already works correctly on hardware defaults with no software
-	 * help on either kernel, so there's nothing to restore here.
-	 */
-
-	/*
-	 * RGMII Mode Selector (shadow 0x0b) -- the actual fix. Not one of
-	 * mainline's named LED registers; the vendor's WD-specific
-	 * bcm54610_config_init() hack (shared by BCM54610/BCM54612 in that
-	 * tree) writes this as a side effect of what its own comment calls
-	 * "disable half-duplex" (the real half-duplex-disable part is two
-	 * separate writes to MII regs 4/9; this shadow-0x0b write is a
-	 * third, distinct action that same function performs, dismissed
-	 * early in this investigation as "not LED-related" based on the
-	 * register's generic name alone). A full blind register sweep
-	 * (every shadow reg 0x00-0x1f, every expansion reg on the three
-	 * pages any BCM54xx code in this driver selects) diffed against the
-	 * same sweep on the vendor kernel turned up this as the one
-	 * meaningful difference among them: hardware default (untouched)
-	 * here vs. 0x08c on the vendor kernel -- exactly the DATA field the
-	 * WD hack's own raw MDIO writes encode. Confirmed on real hardware
-	 * (putty.log.213): with this written, the "Link" LED responds for
-	 * the first time in this entire investigation.
-	 */
 	phy_write(phydev, MII_BCM54XX_SHD,
 		  MII_BCM54XX_SHD_WRITE | MII_BCM54XX_SHD_VAL(BCM54XX_SHD_RGMII_MODE) |
 		  MII_BCM54XX_SHD_DATA(PFE_PHY_SHD_RGMII_MODE_VENDOR_VAL));
@@ -440,25 +332,6 @@ static int pfe_phy_init(struct net_device *dev)
 		return -ENODEV;
 	}
 
-	/*
-	 * Real hardware regression found post-Stage-P8: only one of this
-	 * port's two LEDs showed activity, vs. both on the 3.2.26 vendor
-	 * kernel on the same board/cable/switch. Traced to
-	 * bcm54612e_config_init() (drivers/net/phy/broadcom.c) -- mainline-
-	 * only code that didn't exist in the vendor's 2012-era kernel --
-	 * which by default repurposes this PHY's LED4 pin as a CLK125
-	 * reference-clock output rather than leaving it as an LED, unless
-	 * told PHY_BRCM_RX_REFCLK_UNUSED. Nothing on this board consumes a
-	 * PHY-sourced 125 MHz reference clock (RGMII carries its own TXC/
-	 * RXC), so that repurposing silently darkens an LED that's supposed
-	 * to just show activity. of_phy_get_and_connect() has no way to set
-	 * phydev->dev_flags before phy_connect_direct() runs config_init(),
-	 * so this uses of_phy_connect() instead, which does
-	 * ("phy->dev_flags |= flags;" before connecting, drivers/net/mdio/
-	 * of_mdio.c) -- priv->phy_mode already comes from of_get_phy_mode()
-	 * in pfe_eth_probe_gem(), same as of_phy_get_and_connect() would
-	 * look up internally.
-	 */
 	phydev = of_phy_connect(dev, phy_np, pfe_eth_adjust_link,
 				 PHY_BRCM_RX_REFCLK_UNUSED, priv->phy_mode);
 	of_node_put(phy_np);
@@ -505,46 +378,60 @@ static void pfe_eth_stop(struct pfe_eth_priv_s *priv)
 		phy_stop(priv->phydev);
 }
 
-/*
- * TX queue index this port always submits to. The client registers
- * EMAC_TXQ_CNT (16) SW queues (matching the vendor's per-packet
- * priority classification, pfe_eth_get_queuenum() in the vendor
- * driver), but this port doesn't implement any QoS classification --
- * everything goes on queue 0, the same "unclassified default" queue
- * traffic lands on in the vendor driver's own default configuration
- * (priv->default_priority, never set to anything else there either).
- */
-#define PFE_ETH_TXQ	0
-
-/*
- * Per-call cap on how many completed Tx descriptors hif_tx_done_process()
- * (called inside hif_lib_tx_get_next_complete(), Stage P5) will process
- * in one go -- distinct from pfe_hif.c's own private TX_FREE_MAX_COUNT
- * (64), which bounds the same call from the HIF ring's own housekeeping
- * path instead. 16 matches the vendor's TX_FREE_MAX_COUNT for this
- * client-level flush.
- */
+#define PFE_ETH_TXQ		0
 #define PFE_ETH_TX_FREE_MAX	16
+#define PFE_TX_MIN_HEADLEN	54U
+#define PFE_TX_STOP_THRES	64U
+#define PFE_TX_WAKE_THRES	128U
 
 /*
- * Drain everything currently queued for this client/qno, copying each
- * buffer's payload into a freshly allocated skb rather than wrapping
- * the buffer itself with build_skb(). The buffer is dma_alloc_
- * coherent() memory (pfe_hif_lib.h's pfe_hif_spare_buf_get(), see the
- * comment there for why) and must go back to pfe_hif_spare_buf_put(),
- * never generic kfree() -- which rules out build_skb()/zero-copy, since
- * the network stack tears an skb's data down with kfree() once
- * head_frag is unset. This matches the vendor driver's own
- * pfe_eth_rx_skb(), which copies out of its (also specially-allocated,
- * GFP_DMA_NCNB) buffer pool for the same reason.
- *
- * Every normal Ethernet frame fits in one HIF descriptor (PFE_PKT_SIZE,
- * 1544, comfortably covers any standard MTU + headers), so the
- * multi-descriptor/jumbo reassembly the vendor's pfe_eth_rx_skb() does
- * (chaining fragments via skb_shinfo()->frag_list, tracked per-qno in
- * priv->skb_inflight[]) isn't ported -- if CL_DESC_FIRST and
- * CL_DESC_LAST aren't both set on the same descriptor, this port has
- * no way to reassemble it, so it's dropped instead of mishandled.
+ * Reap completed TX skbs, update BQL byte/packet accounting, and wake a
+ * stopped netdev queue once available TX slots reach tx_wake_thres.
+ */
+static void __pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
+{
+	struct net_device *dev = priv->dev;
+	int reap_max = max_t(int, count, PFE_ETH_TX_FREE_MAX);
+	unsigned int completed_pkts = 0;
+	unsigned int completed_bytes = 0;
+	struct sk_buff *skb;
+	unsigned int flags;
+
+	while (count-- > 0) {
+		skb = hif_lib_tx_get_next_complete(&priv->client, qno, &flags, reap_max);
+		if (!skb)
+			break;
+
+		if (flags & HIF_DATA_VALID) {
+			completed_pkts++;
+			completed_bytes += skb->len;
+			dev_consume_skb_any(skb);
+		}
+	}
+
+	if (completed_pkts)
+		netdev_completed_queue(dev, completed_pkts, completed_bytes);
+
+	if (unlikely(!priv->closing && netif_running(dev) && netif_queue_stopped(dev)) &&
+	    hif_lib_tx_avail(&priv->client, qno) >= priv->tx_wake_thres) {
+		priv->tx_wake_thres = PFE_TX_WAKE_THRES;
+		pfe_hif_release_tx_irq(&priv->pfe->hif, priv->client.id);
+		priv->sw_stats.tx_queue_wakes++;
+		netif_wake_queue(dev);
+	}
+}
+
+static void pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
+{
+	spin_lock_bh(&priv->tx_clean_lock);
+	__pfe_eth_flush_txq(priv, qno, count);
+	spin_unlock_bh(&priv->tx_clean_lock);
+}
+
+/*
+ * Drain received frames from the client RX queue into skbs built over
+ * page-fragment buffers (build_skb), rejecting multi-descriptor frames and
+ * out-of-range lengths/offsets before GRO delivery.
  */
 static void pfe_eth_rx_drain(struct pfe_eth_priv_s *priv, unsigned int qno)
 {
@@ -554,19 +441,15 @@ static void pfe_eth_rx_drain(struct pfe_eth_priv_s *priv, unsigned int qno)
 	int length, offset;
 	struct sk_buff *skb;
 
+	BUILD_BUG_ON(PFE_PKT_HEADROOM + PFE_PKT_SIZE +
+		     SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) > PFE_BUF_SIZE);
+
 	for (;;) {
 		buf_addr = hif_lib_receive_pkt(&priv->client, qno, &length, &offset,
 						&rx_ctrl, &desc_ctrl, &priv_data);
 		if (!buf_addr)
 			break;
 
-		/*
-		 * hif_lib_receive_pkt() hands back the true base of the
-		 * dma_alloc_coherent() block (what build_skb() used to
-		 * need); pfe_hif_spare_buf_put() takes the same "usable"
-		 * (base + headroom) pointer pfe_hif_spare_buf_get() returns,
-		 * so every free below adds the headroom back.
-		 */
 		if (!(desc_ctrl & CL_DESC_FIRST) || !(desc_ctrl & CL_DESC_LAST)) {
 			net_warn_ratelimited("%s: dropping unsupported multi-descriptor packet (ctrl=%#x)\n",
 					      dev->name, desc_ctrl);
@@ -575,11 +458,15 @@ static void pfe_eth_rx_drain(struct pfe_eth_priv_s *priv, unsigned int qno)
 			continue;
 		}
 
-		/* Zero-copy: wrap the whole fragment, the stack frees it
-		 * (skb_free_frag()) when done. offset already skips the
-		 * headroom + HIF header, and PFE_BUF_SIZE leaves room for
-		 * skb_shared_info after the packet area.
-		 */
+		if (unlikely(length < ETH_HLEN || offset < 0 ||
+			     offset + length > SKB_WITH_OVERHEAD(PFE_BUF_SIZE))) {
+			net_warn_ratelimited("%s: dropping invalid rx length=%d offset=%d\n",
+					      dev->name, length, offset);
+			pfe_hif_spare_buf_put(buf_addr + PFE_PKT_HEADROOM);
+			dev->stats.rx_dropped++;
+			continue;
+		}
+
 		skb = build_skb(buf_addr, PFE_BUF_SIZE);
 		if (!skb) {
 			pfe_hif_spare_buf_put(buf_addr + PFE_PKT_HEADROOM);
@@ -600,10 +487,6 @@ static void pfe_eth_rx_drain(struct pfe_eth_priv_s *priv, unsigned int qno)
 		dev->stats.rx_packets++;
 		dev->stats.rx_bytes += length;
 
-		/* Runs inside the HIF NAPI poll (pfe_hif_rx_poll()), so GRO can
-		 * coalesce consecutive TCP segments before they hit the stack;
-		 * napi_complete_done() in the poll flushes whatever is held.
-		 */
 		napi_gro_receive(&priv->pfe->hif.napi, skb);
 	}
 }
@@ -615,10 +498,11 @@ static int pfe_eth_event_handler(void *data, int event, int qno)
 	switch (event) {
 	case EVENT_RX_PKT_IND:
 		pfe_eth_rx_drain(priv, qno);
-		/* Edge-triggered -- re-arm so the next arrival indicates
-		 * again (see hif_lib_event_handler_start()'s own comment).
-		 */
 		hif_lib_event_handler_start(&priv->client, EVENT_RX_PKT_IND, qno);
+		break;
+	case EVENT_TXDONE_IND:
+		pfe_eth_flush_txq(priv, PFE_ETH_TXQ, EMAC_TXQ_DEPTH);
+		hif_lib_event_handler_start(&priv->client, EVENT_TXDONE_IND, qno);
 		break;
 	default:
 		break;
@@ -627,64 +511,40 @@ static int pfe_eth_event_handler(void *data, int event, int qno)
 	return 0;
 }
 
-/*
- * Free skbs for Tx descriptors the hardware has finished with. Called
- * both opportunistically after every send (so the ring doesn't fill up
- * under sustained traffic) and forced on close() (so nothing referenced
- * by the about-to-be-freed tx_qbase leaks -- see pfe_eth_close()).
- */
-static void pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
+static void pfe_eth_maybe_stop_txq(struct pfe_eth_priv_s *priv, unsigned int stop_thres)
 {
-	struct sk_buff *skb;
-	unsigned int flags;
+	struct net_device *dev = priv->dev;
+	unsigned int wake_thres = max_t(unsigned int, PFE_TX_WAKE_THRES, stop_thres);
 
-	while (count-- > 0) {
-		skb = hif_lib_tx_get_next_complete(&priv->client, qno, &flags, PFE_ETH_TX_FREE_MAX);
-		if (!skb)
-			break;
+	spin_lock_bh(&priv->tx_clean_lock);
 
-		if (flags & HIF_DATA_VALID)
-			dev_kfree_skb_any(skb);
+	if (unlikely(priv->closing || !netif_running(dev))) {
+		spin_unlock_bh(&priv->tx_clean_lock);
+		return;
 	}
+
+	if (unlikely(hif_lib_tx_avail(&priv->client, PFE_ETH_TXQ) < stop_thres)) {
+		priv->tx_wake_thres = wake_thres;
+		netif_stop_queue(dev);
+		priv->sw_stats.tx_queue_stops++;
+		pfe_hif_request_tx_irq(&priv->pfe->hif, priv->client.id);
+		__pfe_eth_flush_txq(priv, PFE_ETH_TXQ, EMAC_TXQ_DEPTH);
+	}
+
+	spin_unlock_bh(&priv->tx_clean_lock);
 }
 
-/*
- * Layout of the CLASS PE firmware's phy_port[] array (vendor tree's
- * pfe/pfe/c2000/common/types.h -- "struct itf { void *phys; u8 type;
- * u8 index; }" padded to 8 bytes, then "struct physical_port { struct
- * itf itf; u8 mac_addr[6]; u8 id; }" padded to 16 -- confirmed via
- * readelf -sW against our own firmware/ls1024a-pfe/class_c2000.elf:
- * phy_port @ 0x1610, size 80 = 5 * 16 (MAX_PHY_PORTS = GEM_PORTS(3) +
- * MAX_WIFI_VAPS(2) in that build)).
- */
 #define PHY_PORT_STRUCT_SIZE	16
 #define PHY_PORT_ITF_INDEX_OFF	5
 #define PHY_PORT_MAC_ADDR_OFF	8
 
-/*
- * Without this, the CLASS PE firmware never learns this port's MAC
- * address or interface index -- confirmed on real hardware to be
- * required for the firmware to forward any received frame to the host
- * at all: TX worked fine without it, but RX stayed at 0 packets
- * forever, even after minutes of real broadcast/DHCP traffic on the
- * wire. This mirrors two of the DMEM writes the vendor host driver's
- * pfe_ctrl_set_eth_state()/CMD_TX_ENABLE made as a side effect of an
- * FCI command this port doesn't implement (see pfe_ctrl.h's banner for
- * why the FCI apparatus itself isn't ported) -- done directly here
- * instead of routing through that dropped command-handler machinery.
- * Vendor's own onif/bridge registration (add_onif()/
- * bridge_interface_register(), also part of that same FCI init path)
- * is genuinely bridging-specific (forwarding *between* GEM0/1/2) and
- * isn't needed for this port's "receive my own traffic, deliver it to
- * my own HIF client" case.
- */
 static void pfe_eth_class_register_port(struct pfe_eth_priv_s *priv)
 {
-	unsigned long base = priv->pfe->class_phy_port_dmem + priv->id * PHY_PORT_STRUCT_SIZE;
+	unsigned long base = priv->pfe->class_phy_port_dmem + PFE_GEM0_ID * PHY_PORT_STRUCT_SIZE;
 	int id;
 
 	for (id = CLASS0_ID; id <= CLASS_MAX_ID; id++) {
-		pe_dmem_write(id, priv->id, base + PHY_PORT_ITF_INDEX_OFF, 1);
+		pe_dmem_write(id, PFE_GEM0_ID, base + PHY_PORT_ITF_INDEX_OFF, 1);
 		pe_dmem_memcpy_to32(id, base + PHY_PORT_MAC_ADDR_OFF, priv->dev->dev_addr, ETH_ALEN);
 	}
 }
@@ -697,7 +557,7 @@ static int pfe_eth_open(struct net_device *dev)
 	int rc;
 
 	memset(client, 0, sizeof(*client));
-	client->id = PFE_CL_GEM0 + priv->id;
+	client->id = PFE_CL_GEM0;
 	client->tx_qn = EMAC_TXQ_CNT;
 	client->rx_qn = EMAC_RXQ_CNT;
 	client->tx_qsize = EMAC_TXQ_DEPTH;
@@ -706,10 +566,15 @@ static int pfe_eth_open(struct net_device *dev)
 	client->pfe = priv->pfe;
 	client->event_handler = pfe_eth_event_handler;
 
+	spin_lock_bh(&priv->tx_clean_lock);
+	priv->closing = false;
+	priv->tx_wake_thres = PFE_TX_WAKE_THRES;
+	spin_unlock_bh(&priv->tx_clean_lock);
+
 	rc = hif_lib_client_register(client);
 	if (rc) {
 		netdev_err(dev, "hif_lib_client_register(%d) failed: %d\n", client->id, rc);
-		return rc;
+		goto err_register;
 	}
 
 	pfe_gemac_init(priv);
@@ -720,12 +585,6 @@ static int pfe_eth_open(struct net_device *dev)
 		goto err_addr;
 	}
 
-	/*
-	 * gemac_set_laddrN() takes a MAC_ADDR {u32 bottom; u32 top;} pair.
-	 * The vendor driver gets there via (MAC_ADDR *)dev->dev_addr, which
-	 * reads 2 bytes past the end of the 6-byte dev_addr[] array -- build
-	 * the pair explicitly instead of copying that over-read.
-	 */
 	addr.bottom = get_unaligned_le32(dev->dev_addr);
 	addr.top = get_unaligned_le16(dev->dev_addr + 4);
 	gemac_set_laddrN(priv->EMAC_baseaddr, &addr, 1);
@@ -739,164 +598,243 @@ static int pfe_eth_open(struct net_device *dev)
 			goto err_addr;
 		}
 	} else {
+		netif_carrier_off(dev);
 		netdev_info(dev, "no phy-handle in DT yet -- link will stay down\n");
 	}
 
 	pfe_eth_start(priv);
 
-	/*
-	 * Must run after pfe_eth_start(), not right after connecting in
-	 * pfe_phy_init() -- confirmed on real hardware (putty.log.203/204/
-	 * 205) that the write lands fine at connect() time but is gone
-	 * again by the time link-up is reported a few ms later. Root cause:
-	 * pfe_eth_start()'s phy_start() unconditionally calls
-	 * __phy_resume() (drivers/net/phy/phy.c) regardless of whether the
-	 * PHY was ever actually suspended, which for this driver calls
-	 * bcm54xx_resume() -> ends by re-running bcm54xx_config_init() --
-	 * the exact function whose LED1/LED3 multicolor override and ECR
-	 * interrupt masking this fix exists to undo. of_phy_connect()
-	 * itself already goes through the same config_init/resume dance
-	 * once internally (phy_attach_direct() calls phy_init_hw() then
-	 * unconditionally phy_resume()), so the value written in
-	 * pfe_phy_init() never had a chance regardless -- this is the
-	 * first point after phy_start() where it can actually stick.
-	 */
 	if (priv->phydev)
 		pfe_phy_restore_led_mode(priv->phydev);
 
+	netdev_reset_queue(dev);
 	netif_start_queue(dev);
 
 	return 0;
 
 err_addr:
 	hif_lib_client_unregister(client);
+err_register:
+	spin_lock_bh(&priv->tx_clean_lock);
+	priv->closing = true;
+	spin_unlock_bh(&priv->tx_clean_lock);
 	return rc;
 }
 
+/*
+ * Stop TX and PHY/MAC, poll pending TX completions for up to ~10 ms,
+ * and orphan any descriptors still in flight before unregistering the client.
+ */
 static int pfe_eth_close(struct net_device *dev)
 {
 	struct pfe_eth_priv_s *priv = netdev_priv(dev);
+	int retries = 100;
 
-	netif_stop_queue(dev);
+	spin_lock_bh(&priv->tx_clean_lock);
+	priv->closing = true;
+	spin_unlock_bh(&priv->tx_clean_lock);
+
+	netif_tx_disable(dev);
 
 	pfe_eth_stop(priv);
 
 	if (priv->phydev)
 		pfe_phy_exit(dev);
 
-	/*
-	 * Force-flush every Tx descriptor still in flight before releasing
-	 * tx_qbase (inside hif_lib_client_unregister()) -- otherwise any
-	 * skb pointer sitting in a not-yet-completed descriptor leaks,
-	 * since the memory holding that pointer is about to be freed out
-	 * from under it. EMAC_TXQ_DEPTH (1024) bounds the loop.
-	 */
-	pfe_eth_flush_txq(priv, PFE_ETH_TXQ, EMAC_TXQ_DEPTH);
+	while (priv->client.tx_q[PFE_ETH_TXQ].tx_pending && retries-- > 0) {
+		pfe_eth_flush_txq(priv, PFE_ETH_TXQ, EMAC_TXQ_DEPTH);
+		if (!priv->client.tx_q[PFE_ETH_TXQ].tx_pending)
+			break;
+		udelay(100);
+	}
+
+	if (unlikely(priv->client.tx_q[PFE_ETH_TXQ].tx_pending)) {
+		struct hif_client_tx_queue *q = &priv->client.tx_q[PFE_ETH_TXQ];
+
+		netdev_warn(dev, "closing with %u pending TX descriptors\n",
+			    q->tx_pending);
+		spin_lock_bh(&priv->tx_clean_lock);
+		hif_tx_lock(&priv->pfe->hif);
+		pfe_hif_tx_orphan_client(&priv->pfe->hif, priv->client.id, q);
+		hif_tx_unlock(&priv->pfe->hif);
+		spin_unlock_bh(&priv->tx_clean_lock);
+	}
+
+	netdev_reset_queue(dev);
+	pfe_hif_release_tx_irq(&priv->pfe->hif, priv->client.id);
 
 	hif_lib_client_unregister(&priv->client);
 
 	return 0;
 }
 
-static netdev_tx_t pfe_eth_send_one(struct sk_buff *skb, struct net_device *dev)
+static void pfe_eth_unmap_frag_segs(struct device *dma_dev,
+				    const struct pfe_tx_sg_seg *segs,
+				    unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		if (segs[i].dma)
+			dma_unmap_page(dma_dev, segs[i].dma, segs[i].len,
+				       DMA_TO_DEVICE);
+	}
+}
+
+/*
+ * Transmit an skb using scatter-gather segments (splitting fragments at
+ * PFE_HIF_MAX_BD_LEN and linearizing if descriptor count would exceed
+ * PFE_TX_MAX_SG_DESCS or frag_list is present); large GSO skbs are
+ * segmented by the Linux 6.18 stack before reaching ndo_start_xmit().
+ */
+static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *dev)
 {
 	struct pfe_eth_priv_s *priv = netdev_priv(dev);
+	struct device *dma_dev = priv->pfe->hif.dev;
+	struct pfe_tx_sg_seg frag_segs[PFE_TX_MAX_SG_DESCS - 1];
+	unsigned int nr_frag_segs = 0;
+	unsigned int pkt_len = skb->len;
 	u32 ctrl = 0;
+	int rc;
 
-	/* The class PE computes the IPv4 header and TCP/UDP checksums when
-	 * HIF_CTRL_TX_CHECKSUM is set in the HIF header (vendor
-	 * pfe_eth_send_packet() does the same for CHECKSUM_PARTIAL).
-	 */
 	if (skb->ip_summed == CHECKSUM_PARTIAL)
 		ctrl = HIF_CTRL_TX_CHECKSUM;
 
-	if (skb_headroom(skb) < sizeof(struct hif_hdr) &&
-	    pskb_expand_head(skb, sizeof(struct hif_hdr), 0, GFP_ATOMIC)) {
+	if (skb_is_nonlinear(skb)) {
+		bool need_linearize = skb_has_frag_list(skb);
+		unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
+		unsigned int est_descs = 1;
+		unsigned int i;
+
+		for (i = 0; !need_linearize && i < nr_frags; i++) {
+			unsigned int flen = skb_frag_size(&skb_shinfo(skb)->frags[i]);
+
+			if (!flen)
+				continue;
+			est_descs += DIV_ROUND_UP(flen, PFE_HIF_MAX_BD_LEN);
+			if (est_descs > PFE_TX_MAX_SG_DESCS)
+				need_linearize = true;
+		}
+
+		if (need_linearize) {
+			priv->sw_stats.tx_sg_linearized++;
+			if (skb_linearize(skb)) {
+				dev_kfree_skb_any(skb);
+				dev->stats.tx_dropped++;
+				return NETDEV_TX_OK;
+			}
+		}
+	}
+
+	if (skb_headlen(skb) < min_t(unsigned int, pkt_len, PFE_TX_MIN_HEADLEN) &&
+	    !pskb_may_pull(skb, min_t(unsigned int, pkt_len, PFE_TX_MIN_HEADLEN))) {
 		dev_kfree_skb_any(skb);
 		dev->stats.tx_dropped++;
 		return NETDEV_TX_OK;
 	}
 
-	if (skb_linearize(skb)) {
+	if (unlikely(skb_cow_head(skb, sizeof(struct hif_hdr)) < 0)) {
 		dev_kfree_skb_any(skb);
 		dev->stats.tx_dropped++;
 		return NETDEV_TX_OK;
 	}
 
-	/*
-	 * No external tx_lock here: hif_lib_xmit_pkt() calls hif_xmit_pkt()
-	 * (pfe_hif.c, Stage P5), which already takes hif->tx_lock itself
-	 * (and already calls hif_tx_dma_start() on the success path) --
-	 * wrapping this call in another hif_tx_lock()/hif_tx_unlock() pair
-	 * self-deadlocked on real hardware the first time real traffic (an
-	 * IPv6 MLD report) actually reached this path, since spin_lock_bh()
-	 * isn't reentrant.
-	 *
-	 * No hardware checksum offload wired up (NETIF_F_IP_CSUM isn't a
-	 * declared feature, so skb->ip_summed should never actually be
-	 * CHECKSUM_PARTIAL here) and no queue-full backpressure -- ring is
-	 * 1024 deep (EMAC_TXQ_DEPTH), comfortably more than this baseline's
-	 * DHCP+ping target needs; a full ring just drops, like any driver
-	 * without a stop/wake-queue implementation should, rather than
-	 * returning NETDEV_TX_BUSY with nothing to ever un-stick it.
-	 */
-	if (hif_lib_xmit_pkt(&priv->client, PFE_ETH_TXQ, skb->data, skb->len, ctrl, skb)) {
+	if (unlikely(sizeof(struct hif_hdr) + skb_headlen(skb) > PFE_HIF_MAX_BD_LEN)) {
+		dev_kfree_skb_any(skb);
+		dev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
+
+	if (skb_is_nonlinear(skb)) {
+		unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
+		unsigned int i;
+
+		for (i = 0; i < nr_frags; i++) {
+			const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			unsigned int flen = skb_frag_size(frag);
+			unsigned int off = 0;
+
+			while (flen > 0) {
+				unsigned int chunk = min_t(unsigned int, flen,
+							   PFE_HIF_MAX_BD_LEN);
+
+				if (unlikely(nr_frag_segs >= ARRAY_SIZE(frag_segs))) {
+					pfe_eth_unmap_frag_segs(dma_dev, frag_segs,
+								nr_frag_segs);
+					dev_kfree_skb_any(skb);
+					dev->stats.tx_dropped++;
+					return NETDEV_TX_OK;
+				}
+
+				frag_segs[nr_frag_segs].dma =
+					skb_frag_dma_map(dma_dev, frag, off,
+							 chunk, DMA_TO_DEVICE);
+				if (unlikely(dma_mapping_error(dma_dev,
+							       frag_segs[nr_frag_segs].dma))) {
+					pfe_eth_unmap_frag_segs(dma_dev, frag_segs,
+								nr_frag_segs);
+					dev_kfree_skb_any(skb);
+					dev->stats.tx_dropped++;
+					return NETDEV_TX_OK;
+				}
+
+				frag_segs[nr_frag_segs].len = chunk;
+				frag_segs[nr_frag_segs].map_type = PFE_TX_MAP_PAGE;
+				nr_frag_segs++;
+				off += chunk;
+				flen -= chunk;
+			}
+		}
+	}
+
+	rc = hif_lib_xmit_pkt_sg(&priv->client, PFE_ETH_TXQ,
+				 skb->data, skb_headlen(skb),
+				 frag_segs, nr_frag_segs, ctrl, skb,
+				 dev, pkt_len);
+	if (unlikely(rc)) {
+		pfe_eth_unmap_frag_segs(dma_dev, frag_segs, nr_frag_segs);
+		if (rc == -EBUSY) {
+			priv->sw_stats.tx_busy_retries++;
+			pfe_eth_maybe_stop_txq(priv, PFE_TX_STOP_THRES);
+			return NETDEV_TX_BUSY;
+		}
 		dev_kfree_skb_any(skb);
 		dev->stats.tx_dropped++;
 		return NETDEV_TX_OK;
 	}
 
 	dev->stats.tx_packets++;
-	dev->stats.tx_bytes += skb->len;
+	dev->stats.tx_bytes += pkt_len;
+	if (nr_frag_segs) {
+		priv->sw_stats.tx_sg_pkts++;
+		priv->sw_stats.tx_sg_frags += nr_frag_segs;
+	}
 
-	pfe_eth_flush_txq(priv, PFE_ETH_TXQ, PFE_ETH_TX_FREE_MAX);
+	pfe_eth_flush_txq(priv, PFE_ETH_TXQ,
+			  max_t(int, PFE_ETH_TX_FREE_MAX, (int)(1 + nr_frag_segs)));
+	pfe_eth_maybe_stop_txq(priv, PFE_TX_STOP_THRES);
 
 	return NETDEV_TX_OK;
 }
 
-static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *dev)
+static void pfe_eth_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
-	struct sk_buff *segs, *seg, *next;
-	netdev_features_t features;
+	struct pfe_eth_priv_s *priv = netdev_priv(dev);
+	struct pfe_hif *hif = &priv->pfe->hif;
+	struct hif_client_tx_queue *q = &priv->client.tx_q[PFE_ETH_TXQ];
+	struct hif_tx_queue *hq = &hif->client[priv->client.id].tx_q[PFE_ETH_TXQ];
+	u32 ttc = READ_ONCE(hif->Txtoclean);
 
-	if (likely(!skb_is_gso(skb)))
-		return pfe_eth_send_one(skb, dev);
+	priv->sw_stats.tx_timeouts++;
+	netdev_warn(dev, "TX timeout (q=%u pending=%u r=%u w=%u ack=%u | hif avail=%u send=%u clean=%u bd_ctrl=%#x)\n",
+		    txqueue, q->tx_pending, q->read_idx, q->write_idx, hq->ack_idx,
+		    READ_ONCE(hif->TxAvail), READ_ONCE(hif->Txtosend), ttc,
+		    READ_ONCE(hif->TxBase[ttc].ctrl));
 
-	/*
-	 * Software GSO: dev->features advertises NETIF_F_TSO/_TSO6 only so
-	 * TCP composes large skbs instead of one per MSS (see the comment
-	 * at the hw_features assignment in pfe_eth_probe_gem()) -- this
-	 * driver has no hardware segmentation wired up, so re-segment here
-	 * into real, individually-submitted packets. Clearing NETIF_F_GSO_MASK
-	 * (but not NETIF_F_SG/_IP_CSUM/_IPV6_CSUM) forces skb_gso_segment()
-	 * to actually split the skb, while still leaving each resulting
-	 * segment's ip_summed as CHECKSUM_PARTIAL so it goes through the
-	 * existing, already-working HIF_CTRL_TX_CHECKSUM offload path below.
-	 */
-	features = dev->features & ~NETIF_F_GSO_MASK;
-	segs = skb_gso_segment(skb, features);
-	if (IS_ERR(segs) || !segs) {
-		dev_kfree_skb_any(skb);
-		dev->stats.tx_dropped++;
-		return NETDEV_TX_OK;
-	}
-	dev_consume_skb_any(skb);
-
-	skb_list_walk_safe(segs, seg, next) {
-		skb_mark_not_on_list(seg);
-		pfe_eth_send_one(seg, dev);
-	}
-
-	return NETDEV_TX_OK;
+	pfe_eth_flush_txq(priv, PFE_ETH_TXQ, EMAC_TXQ_DEPTH);
+	hif_tx_dma_start();
 }
 
-/*
- * 6-bit CRC-free hash over a MAC address, ported unchanged from the
- * vendor's pfe_eth_get_hash(): XOR-folds each 6-bit group of the 48-bit
- * address together. The result selects one bit of the GEMAC's 64-bit
- * hash register (gemac_set_hash()) -- this is the hardware's multicast
- * (and overflow-unicast) address filter, not a general-purpose hash.
- */
 static int pfe_eth_get_hash(const u8 *addr)
 {
 	u8 temp1, temp2, temp3, temp4, temp5, temp6, temp7, temp8;
@@ -913,26 +851,16 @@ static int pfe_eth_get_hash(const u8 *addr)
 	return temp1 ^ temp2 ^ temp3 ^ temp4 ^ temp5 ^ temp6 ^ temp7 ^ temp8;
 }
 
-/*
- * .ndo_set_rx_mode -- ported from the vendor's pfe_eth_set_multi(). Without
- * this, the GEMAC's multicast filter stays in the disabled state
- * pfe_gemac_init() leaves it in at probe time and never gets enabled, no
- * matter what multicast groups the stack joins. IPv6 depends on this far
- * more than IPv4 does: Neighbor Discovery and Router Advertisement are
- * multicast-only (solicited-node ff02::1:ffXX:XXXX / MAC 33:33:ffXX:XXXX,
- * all-nodes ff02::1), so without a working hash filter, neighbor/router
- * resolution over IPv6 depends entirely on stale cache entries or timing
- * luck instead of actually working -- indistinguishable from "IPv6 is
- * flaky" until traced back here.
- */
 static void pfe_eth_set_multi(struct net_device *dev)
 {
 	struct pfe_eth_priv_s *priv = netdev_priv(dev);
 	struct netdev_hw_addr *ha;
 	MAC_ADDR hash_addr;
 	MAC_ADDR spec_addr;
+	MAC_ADDR zero_addr = { .bottom = 0, .top = 0 };
+	int programmed_uc = 0;
 	int uc_count = 0;
-	int result;
+	int result, slot;
 
 	if (dev->flags & IFF_PROMISC)
 		gemac_enable_copy_all(priv->EMAC_baseaddr);
@@ -945,19 +873,18 @@ static void pfe_eth_set_multi(struct net_device *dev)
 		gemac_no_broadcast(priv->EMAC_baseaddr);
 
 	if (dev->flags & IFF_ALLMULTI) {
-		/* Hash-match every multicast address. */
 		hash_addr.bottom = 0xFFFFFFFF;
 		hash_addr.top = 0xFFFFFFFF;
 		gemac_set_hash(priv->EMAC_baseaddr, &hash_addr);
 		gemac_enable_multicast(priv->EMAC_baseaddr);
 
 		netdev_for_each_uc_addr(ha, dev) {
-			if (uc_count >= EMAC_SPEC_ADDR_MAX - 1)
+			if (programmed_uc >= EMAC_SPEC_ADDR_MAX - 1)
 				break;
 			spec_addr.bottom = get_unaligned_le32(ha->addr);
 			spec_addr.top = get_unaligned_le16(ha->addr + 4);
-			gemac_set_laddrN(priv->EMAC_baseaddr, &spec_addr, uc_count + 2);
-			uc_count++;
+			gemac_set_laddrN(priv->EMAC_baseaddr, &spec_addr, programmed_uc + 2);
+			programmed_uc++;
 		}
 	} else if (netdev_mc_count(dev) || netdev_uc_count(dev)) {
 		hash_addr.bottom = 0;
@@ -965,8 +892,8 @@ static void pfe_eth_set_multi(struct net_device *dev)
 
 		netdev_for_each_mc_addr(ha, dev) {
 			result = pfe_eth_get_hash(ha->addr);
-			if (result >= EMAC_HASH_REG_BITS)
-				break;
+			if (result < 0 || result >= EMAC_HASH_REG_BITS)
+				continue;
 			if (result < 32)
 				hash_addr.bottom |= BIT(result);
 			else
@@ -979,10 +906,11 @@ static void pfe_eth_set_multi(struct net_device *dev)
 				spec_addr.bottom = get_unaligned_le32(ha->addr);
 				spec_addr.top = get_unaligned_le16(ha->addr + 4);
 				gemac_set_laddrN(priv->EMAC_baseaddr, &spec_addr, uc_count + 2);
+				programmed_uc++;
 			} else {
 				result = pfe_eth_get_hash(ha->addr);
-				if (result >= EMAC_HASH_REG_BITS)
-					break;
+				if (result < 0 || result >= EMAC_HASH_REG_BITS)
+					continue;
 				if (result < 32)
 					hash_addr.bottom |= BIT(result);
 				else
@@ -998,6 +926,9 @@ static void pfe_eth_set_multi(struct net_device *dev)
 	} else {
 		gemac_disable_multicast(priv->EMAC_baseaddr);
 	}
+
+	for (slot = programmed_uc + 2; slot <= EMAC_SPEC_ADDR_MAX; slot++)
+		gemac_set_laddrN(priv->EMAC_baseaddr, &zero_addr, slot);
 
 	if (netdev_uc_count(dev) >= EMAC_SPEC_ADDR_MAX - 1)
 		gemac_enable_unicast(priv->EMAC_baseaddr);
@@ -1022,31 +953,78 @@ static const struct net_device_ops pfe_netdev_ops = {
 	.ndo_set_features = pfe_eth_set_features,
 	.ndo_stop = pfe_eth_close,
 	.ndo_start_xmit = pfe_eth_send_packet,
+	.ndo_tx_timeout = pfe_eth_tx_timeout,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr = eth_validate_addr,
 	.ndo_set_rx_mode = pfe_eth_set_multi,
-	/* SIOCGMIIPHY/SIOCGMIIREG/SIOCSMIIREG -- phy_do_ioctl() dispatches
-	 * to phy_mii_ioctl() when a phydev is attached. Wired up for raw
-	 * MII register access (mii-tool and similar), not otherwise used
-	 * by this driver.
-	 */
 	.ndo_eth_ioctl = phy_do_ioctl,
 };
 
-/*
- * Without this, `ethtool eth0` (link/speed/duplex/autoneg query) fails
- * outright with "No data available" instead of reporting phydev's real
- * state -- there's no core-kernel fallback for the settings ioctl the
- * way there is for driver-info (which is why `ethtool -i eth0` worked
- * even before this was added). phy_ethtool_get/set_link_ksettings() are
- * the standard phylib-backed helpers used by most mainline drivers with
- * an attached PHY; .get_link falls back to netif_carrier_ok() when
- * there's no phydev.
- */
+static const char pfe_ethtool_stat_names[][ETH_GSTRING_LEN] = {
+	"tx_sg_pkts",
+	"tx_sg_frags",
+	"tx_sg_linearized",
+	"tx_queue_stops",
+	"tx_queue_wakes",
+	"tx_busy_retries",
+	"tx_timeouts",
+	"tx_ring_avail",
+	"hif_tx_avail",
+	"hif_tx_irq_count",
+	"hif_napi_sched",
+	"hif_napi_poll",
+	"hif_napi_packets",
+	"hif_napi_descs",
+	"hif_napi_full_budget",
+	"hif_napi_client_full",
+};
+
+static int pfe_ethtool_get_sset_count(struct net_device *dev, int sset)
+{
+	if (sset != ETH_SS_STATS)
+		return -EOPNOTSUPP;
+
+	return ARRAY_SIZE(pfe_ethtool_stat_names);
+}
+
+static void pfe_ethtool_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+{
+	if (stringset == ETH_SS_STATS)
+		memcpy(data, pfe_ethtool_stat_names, sizeof(pfe_ethtool_stat_names));
+}
+
+static void pfe_ethtool_get_stats(struct net_device *dev,
+				  struct ethtool_stats *stats, u64 *data)
+{
+	struct pfe_eth_priv_s *priv = netdev_priv(dev);
+	struct pfe_hif *hif = &priv->pfe->hif;
+	int i = 0;
+
+	data[i++] = priv->sw_stats.tx_sg_pkts;
+	data[i++] = priv->sw_stats.tx_sg_frags;
+	data[i++] = priv->sw_stats.tx_sg_linearized;
+	data[i++] = priv->sw_stats.tx_queue_stops;
+	data[i++] = priv->sw_stats.tx_queue_wakes;
+	data[i++] = priv->sw_stats.tx_busy_retries;
+	data[i++] = priv->sw_stats.tx_timeouts;
+	data[i++] = hif_lib_tx_avail(&priv->client, PFE_ETH_TXQ);
+	data[i++] = READ_ONCE(hif->TxAvail);
+	data[i++] = READ_ONCE(hif->tx_irq_count);
+	data[i++] = hif->napi_counters[NAPI_SCHED_COUNT];
+	data[i++] = hif->napi_counters[NAPI_POLL_COUNT];
+	data[i++] = hif->napi_counters[NAPI_PACKET_COUNT];
+	data[i++] = hif->napi_counters[NAPI_DESC_COUNT];
+	data[i++] = hif->napi_counters[NAPI_FULL_BUDGET_COUNT];
+	data[i++] = hif->napi_counters[NAPI_CLIENT_FULL_COUNT];
+}
+
 static const struct ethtool_ops pfe_ethtool_ops = {
 	.get_link = ethtool_op_get_link,
 	.get_link_ksettings = phy_ethtool_get_link_ksettings,
 	.set_link_ksettings = phy_ethtool_set_link_ksettings,
+	.get_sset_count = pfe_ethtool_get_sset_count,
+	.get_strings = pfe_ethtool_get_strings,
+	.get_ethtool_stats = pfe_ethtool_get_stats,
 };
 
 static void pfe_eth_extphy_clk_release(void *data)
@@ -1057,77 +1035,36 @@ static void pfe_eth_extphy_clk_release(void *data)
 	clk_put(clk);
 }
 
-/*
- * This board's barebox has no per-unit DT (its DTB is compiled into this
- * kernel image, not read from flash/OTP), so the real, per-unit hardware
- * MAC address(es) reach Linux the same way they did under the 3.2.26
- * vendor kernel's legacy ATAG boot path: a "mac_addr=" kernel command
- * line parameter (comma-separated, up to one per GEM), set by barebox's
- * boot script. The vendor kernel consumed this via its own __setup()
- * handler in arch/arm/mach-comcerto/comcerto-2000.c
- * (mac_addr_setup()/mac_addr_init()); this is the DT-based port's
- * equivalent, feeding pfe_eth_probe_gem() below instead of platform
- * data. Confirmed present on this board's real boot log: "commandline:
- * ... mac_addr=00:90:A9:D0:AA:4F ...", and confirmed NOT consumed
- * anywhere before this -- the kernel logs it under "Unknown kernel
- * command line parameters" and passes it through to userspace, meaning
- * every GEM fell back to eth_hw_addr_random() below. That's not just
- * cosmetic: a random MAC on this netdev never matches the CLASS PE
- * firmware's actual traffic (see pfe_eth_class_register_port()'s
- * comment -- the firmware needs to know this port's real MAC to
- * forward anything to the host at all), so this alone can fully
- * account for real inbound traffic never reaching the host on a board
- * that boots this way, independent of anything else.
- */
-static u8 pfe_boot_mac_addr[3][ETH_ALEN];
-static bool pfe_boot_mac_addr_valid[3];
+static u8 pfe_boot_mac_addr[ETH_ALEN];
+static bool pfe_boot_mac_addr_valid;
 
 static int __init pfe_mac_addr_setup(char *str)
 {
 	char *tok;
-	int id;
 
-	for (id = 0; id < 3 && str && *str; id++) {
-		tok = strsep(&str, ",");
-		if (*tok && mac_pton(tok, pfe_boot_mac_addr[id]))
-			pfe_boot_mac_addr_valid[id] = true;
-	}
+	if (!str || !*str)
+		return 1;
+
+	tok = strsep(&str, ",");
+	if (tok && *tok && mac_pton(tok, pfe_boot_mac_addr))
+		pfe_boot_mac_addr_valid = true;
 
 	return 1;
 }
 __setup("mac_addr=", pfe_mac_addr_setup);
 
-static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
+static int pfe_eth_probe_gem0(struct pfe *pfe, struct device_node *np)
 {
 	struct pfe_eth_priv_s *priv;
 	struct net_device *dev;
 	struct clk *extphy_clk;
-	u32 id;
 	int rc;
 
-	if (of_property_read_u32(np, "reg", &id) || id > 2) {
-		dev_err(pfe->dev, "%pOF: missing/invalid reg property\n", np);
-		return -EINVAL;
+	if (pfe_gem0_netdev) {
+		dev_err(pfe->dev, "%pOF: gem0 already registered\n", np);
+		return -EEXIST;
 	}
 
-	/*
-	 * Each GEM has its own "extphy" reference clock line
-	 * (LS1024A_CLK_EXTPHY0/1/2 in clk-ls1024a.c) distinct from the pfe
-	 * node's shared "gemtx" -- confirmed on real hardware to be required
-	 * for this GEM's PHY management (MDIO) to keep working at all. Without
-	 * it, MDIO reads/writes still complete (the bus protocol handshake
-	 * itself doesn't need it) but every read past the first ~1-2s of
-	 * boot silently returns the last successfully-read value instead of
-	 * the register actually requested, regardless of which PHY/register
-	 * is addressed -- traced to the kernel's own "clk: Disabling unused
-	 * clocks" late boot step physically gating this line off, since
-	 * nothing had ever requested it before. gem0 isn't its own struct
-	 * device (no of_platform_populate() for pfe's child nodes), so
-	 * of_clk_get_by_name() rather than devm_clk_get() -- cleanup is tied
-	 * to the parent pfe device's lifetime via devm_add_action_or_reset()
-	 * instead, since nothing currently unbinds a single GEM's node
-	 * independently of the whole pfe device.
-	 */
 	extphy_clk = of_clk_get_by_name(np, "extphy");
 	if (IS_ERR(extphy_clk)) {
 		dev_warn(pfe->dev, "%pOF: no extphy clock (rc=%ld) -- MDIO may stop working after boot\n",
@@ -1139,17 +1076,9 @@ static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
 			clk_put(extphy_clk);
 		} else {
 			rc = devm_add_action_or_reset(pfe->dev, pfe_eth_extphy_clk_release, extphy_clk);
-			if (rc) {
-				clk_disable_unprepare(extphy_clk);
-				clk_put(extphy_clk);
+			if (rc)
 				return rc;
-			}
 		}
-	}
-
-	if (pfe_gem_netdevs[id]) {
-		dev_err(pfe->dev, "%pOF: gem%u already registered\n", np, id);
-		return -EEXIST;
 	}
 
 	dev = alloc_etherdev(sizeof(*priv));
@@ -1159,83 +1088,52 @@ static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
 	SET_NETDEV_DEV(dev, pfe->dev);
 	dev->netdev_ops = &pfe_netdev_ops;
 	dev->ethtool_ops = &pfe_ethtool_ops;
-	/* hif_lib_xmit_pkt() writes struct hif_hdr in place just before
-	 * skb->data -- ask the stack to reserve room for it up front so
-	 * pfe_eth_send_packet()'s pskb_expand_head() fallback is only ever
-	 * needed for an skb that came from somewhere unusual.
-	 */
+	dev->watchdog_timeo = 5 * HZ;
+	dev->min_mtu = ETH_MIN_MTU;
+	dev->max_mtu = ETH_DATA_LEN;
 	dev->needed_headroom = sizeof(struct hif_hdr);
 
-	/* Rx/Tx checksum offload is done by the GEMAC + class PE (same
-	 * firmware the vendor driver uses, which advertises the same bits);
-	 * GRO is pure software on top of the HIF NAPI poll.
-	 *
-	 * TSO/TSO6 here is software GSO, not firmware-assisted segmentation:
-	 * the HIF wire protocol does define a hardware TSO submission path
-	 * (struct hif_tso_hdr, HIF_CTRL_TX_TSO/_TSO6/_TSO_END in pfe_hif.h),
-	 * but its exact field semantics (byte order and units of ip_off/
-	 * ip_id/ip_len/tcp_off/tcp_seq) aren't confirmed anywhere accessible
-	 * right now, and guessing wrong there risks silently corrupting TCP
-	 * streams -- not an acceptable trade for a performance optimization.
-	 * Advertising TSO/SG here still gives a real, safe win: it lets TCP
-	 * compose large (up to 64K) skbs instead of one skb per MSS, which
-	 * pfe_eth_send_packet() below then re-segments in software with
-	 * skb_gso_segment() before handing each real packet to the existing,
-	 * already-verified single-descriptor path. Revive the hardware
-	 * path (struct hif_tso_hdr) once that firmware protocol is
-	 * actually confirmed.
-	 */
 	dev->hw_features = NETIF_F_RXCSUM | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
-			    NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
+			    NETIF_F_SG;
 	dev->features |= dev->hw_features | NETIF_F_GRO;
 
 	priv = netdev_priv(dev);
 	priv->pfe = pfe;
 	priv->dev = dev;
-	priv->id = id;
-	priv->of_node = np;
+	priv->id = PFE_GEM0_ID;
+	priv->of_node = of_node_get(np);
 	priv->mii_bus = pfe_mii_bus;
+	priv->closing = true;
 	spin_lock_init(&priv->lock);
+	spin_lock_init(&priv->tx_clean_lock);
 
-	switch (id) {
-	case 0:
-		priv->EMAC_baseaddr = EMAC1_BASE_ADDR;
-		priv->GPI_baseaddr = EGPI1_BASE_ADDR;
-		break;
-	case 1:
-		priv->EMAC_baseaddr = EMAC2_BASE_ADDR;
-		priv->GPI_baseaddr = EGPI2_BASE_ADDR;
-		break;
-	case 2:
-		priv->EMAC_baseaddr = EMAC3_BASE_ADDR;
-		priv->GPI_baseaddr = EGPI3_BASE_ADDR;
-		break;
-	}
-
-	priv->low_tmuQ = HIF_GEMAC_TMUQ_BASE + id * 2;
+	priv->EMAC_baseaddr = EMAC1_BASE_ADDR;
+	priv->GPI_baseaddr = EGPI1_BASE_ADDR;
+	priv->low_tmuQ = HIF_GEMAC_TMUQ_BASE;
 	priv->high_tmuQ = priv->low_tmuQ + 1;
 
 	if (of_get_phy_mode(np, &priv->phy_mode))
 		priv->phy_mode = PHY_INTERFACE_MODE_MII;
 
 	if (of_get_ethdev_address(np, dev)) {
-		if (pfe_boot_mac_addr_valid[id])
-			eth_hw_addr_set(dev, pfe_boot_mac_addr[id]);
+		if (pfe_boot_mac_addr_valid)
+			eth_hw_addr_set(dev, pfe_boot_mac_addr);
 		else
 			eth_hw_addr_random(dev);
 	}
 
 	rc = register_netdev(dev);
 	if (rc) {
-		dev_err(pfe->dev, "register_netdev() failed for gem%u: %d\n", id, rc);
+		dev_err(pfe->dev, "register_netdev() failed for gem0: %d\n", rc);
+		of_node_put(priv->of_node);
 		free_netdev(dev);
 		return rc;
 	}
 
-	dev_info(pfe->dev, "gem%u registered as %s (phy-mode %s)\n",
-		 id, dev->name, phy_modes(priv->phy_mode));
+	dev_info(pfe->dev, "gem0 registered as %s (phy-mode %s)\n",
+		 dev->name, phy_modes(priv->phy_mode));
 
-	pfe_gem_netdevs[id] = dev;
+	pfe_gem0_netdev = dev;
 
 	return 0;
 }
@@ -1247,20 +1145,6 @@ int pfe_eth_init(struct pfe *pfe)
 	struct device_node *np;
 	int rc;
 
-	/*
-	 * Enabled for the platform device's whole lifetime, not scoped to
-	 * .ndo_open/.ndo_stop like the vendor driver's own clk_enable()/
-	 * clk_disable() calls in pfe_eth_open()/pfe_eth_close() -- a plain
-	 * devm_clk_get() here left the clock unprepared/disabled between
-	 * probe (~1.2s) and the first .ndo_open() (~10s, whenever ifup
-	 * actually runs), and the kernel's own late_initcall "clk: Disabling
-	 * unused clocks" (~2.2s) physically gates off exactly this kind of
-	 * still-unused clock in that window. Confirmed on real hardware:
-	 * every MDIO transaction after that gate-then-open cycle returned
-	 * the same stuck stale value regardless of which register was
-	 * requested, as if the GEMAC's MDIO management sub-block never
-	 * recovered from losing (and later regaining) its clock mid-boot.
-	 */
 	pfe->clk_gem_tx = devm_clk_get_enabled(pfe->dev, "gemtx");
 	if (IS_ERR(pfe->clk_gem_tx))
 		return dev_err_probe(pfe->dev, PTR_ERR(pfe->clk_gem_tx),
@@ -1278,12 +1162,19 @@ int pfe_eth_init(struct pfe *pfe)
 		return rc;
 
 	for_each_available_child_of_node(pfe_np, np) {
+		u32 id;
+
 		if (!of_device_is_compatible(np, "fsl,ls1024a-pfe-gem"))
 			continue;
 
-		rc = pfe_eth_probe_gem(pfe, np);
+		if (of_property_read_u32(np, "reg", &id) || id != PFE_GEM0_ID)
+			continue;
+
+		rc = pfe_eth_probe_gem0(pfe, np);
 		if (rc)
 			dev_err(pfe->dev, "failed to probe %pOF: %d\n", np, rc);
+		of_node_put(np);
+		break;
 	}
 
 	return 0;
@@ -1291,15 +1182,16 @@ int pfe_eth_init(struct pfe *pfe)
 
 void pfe_eth_exit(struct pfe *pfe)
 {
-	int i;
+	struct net_device *dev = pfe_gem0_netdev;
 
-	for (i = 0; i < 3; i++) {
-		if (!pfe_gem_netdevs[i])
-			continue;
+	if (dev) {
+		struct pfe_eth_priv_s *priv = netdev_priv(dev);
+		struct device_node *of_node = priv->of_node;
 
-		unregister_netdev(pfe_gem_netdevs[i]);
-		free_netdev(pfe_gem_netdevs[i]);
-		pfe_gem_netdevs[i] = NULL;
+		unregister_netdev(dev);
+		free_netdev(dev);
+		of_node_put(of_node);
+		pfe_gem0_netdev = NULL;
 	}
 
 	pfe_eth_mdio_exit();

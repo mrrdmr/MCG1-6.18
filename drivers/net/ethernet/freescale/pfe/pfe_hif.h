@@ -2,12 +2,19 @@
 /*
  * HIF (Host Interface) DMA descriptor ring definitions -- ported from
  * the 3.2.26 vendor tree's pfe_ctrl/pfe_hif.h (kmodules/mspd-c2k/pfe/
- * in symops/MCG1-3.2.26).
+ * in symops/MCG1-3.2.26) for Linux 6.18.
+ *
+ * Manual in-driver software GSO segmentation was removed in favor of
+ * kernel-stack GSO; hif_tso_hdr and HIF_CTRL_TX_TSO* remain for
+ * descriptor/header layout compatibility.
  */
 #ifndef _PFE_HIF_H_
 #define _PFE_HIF_H_
 
+#include <linux/bitops.h>
 #include <linux/netdevice.h>
+#include <linux/spinlock.h>
+#include <linux/types.h>
 
 #include "pfe_hw_lib.h" /* struct hif_hdr */
 
@@ -15,6 +22,8 @@ struct pfe;
 struct hif_shm;
 struct rx_queue_desc;
 struct tx_queue_desc;
+struct hif_client_tx_queue;
+struct sk_buff;
 
 #define HIF_CLIENT_QUEUES_MAX	16
 #define HIF_RX_POLL_WEIGHT	64
@@ -90,17 +99,29 @@ struct hif_desc {
 	volatile u32 next;
 };
 
-struct __hif_desc {
-	u32 ctrl;
-	u32 status;
-	u32 data;
+enum pfe_tx_map_type {
+	PFE_TX_MAP_NONE = 0,
+	PFE_TX_MAP_SINGLE,
+	PFE_TX_MAP_PAGE,
 };
 
+/* Software tracking state per TX descriptor; orphaned_skb holds an skb
+ * whose descriptors remain in flight past interface teardown so late
+ * completions can free it without touching a subsequent session's queue.
+ */
 struct hif_desc_sw {
 	dma_addr_t data;
+	struct sk_buff *orphaned_skb;
 	u16 len;
 	u8 client_id;
 	u8 q_no;
+	u8 map_type;
+};
+
+struct pfe_tx_sg_seg {
+	dma_addr_t dma;
+	u16 len;
+	u8 map_type;
 };
 
 struct hif_lro_hdr {
@@ -132,14 +153,16 @@ struct hif_tso_hdr {
 #define HIF_CTRL_RX_CONTINUED	(1 << 1)
 #define HIF_CTRL_VAPID_OFST	8
 
+/* Lock hierarchy: tx_clean_lock (pfe_eth) -> hif->tx_lock (BH);
+ * hif->irq_lock is a leaf lock guarding HIF_INT_ENABLE and tx_irq_clients.
+ */
 struct pfe_hif {
-	/* Registered clients (Stage P7-P9 populates hif_client_register) */
 	struct hif_client client[HIF_CLIENTS_MAX];
 	struct hif_shm *shm;
 	int irq;
 
 	void *descr_baseaddr_v;
-	unsigned long descr_baseaddr_p;
+	dma_addr_t descr_baseaddr_p;
 
 	struct hif_desc *RxBase;
 	u32 RxRingSize;
@@ -159,20 +182,25 @@ struct pfe_hif {
 	struct hif_tso_hdr *tso_hdr_v;
 	dma_addr_t tso_hdr_p;
 
-	spinlock_t tx_lock;
-	spinlock_t lock;
+	spinlock_t tx_lock;	/* protects TX ring indices, TxAvail, and tx_sw_queue */
+	spinlock_t lock;	/* protects client table / Rx ring state (BH context) */
+	spinlock_t irq_lock;	/* leaf lock for HIF_INT_ENABLE and tx_irq_clients */
 	struct net_device *dummy_dev;
 	struct napi_struct napi;
 	struct device *dev;
+	unsigned long tx_irq_clients;
+	u32 tx_irq_count;
 
 	unsigned int napi_counters[NAPI_MAX_COUNT];
 };
 
-void __hif_xmit_pkt(struct pfe_hif *hif, unsigned int client_id, unsigned int q_no,
-		     void *data, u32 len, unsigned int flags);
-int hif_xmit_pkt(struct pfe_hif *hif, unsigned int client_id, unsigned int q_no,
-		  void *data, unsigned int len);
+int __hif_xmit_pkt_sg(struct pfe_hif *hif, unsigned int client_id, unsigned int q_no,
+		      const struct pfe_tx_sg_seg *segs, unsigned int nr_descs);
 void __hif_tx_done_process(struct pfe_hif *hif, int count);
+void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
+			      struct hif_client_tx_queue *q);
+void pfe_hif_request_tx_irq(struct pfe_hif *hif, unsigned int client_id);
+void pfe_hif_release_tx_irq(struct pfe_hif *hif, unsigned int client_id);
 void hif_process_client_req(struct pfe_hif *hif, int req, int data1, int data2);
 int pfe_hif_init(struct pfe *pfe);
 void pfe_hif_exit(struct pfe *pfe);

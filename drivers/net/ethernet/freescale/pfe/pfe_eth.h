@@ -24,6 +24,7 @@
 #include <linux/netdevice.h>
 #include <linux/phy.h>
 #include <linux/spinlock.h>
+#include <linux/types.h>
 
 #include "pfe_hif_lib.h"
 
@@ -33,25 +34,31 @@
 #define EMAC_RXQ_DEPTH		HIF_RX_DESC_NT
 #define EMAC_MDIO_TIMEOUT	1000
 
+struct pfe_eth_sw_stats {
+	u64 tx_sg_pkts;
+	u64 tx_sg_frags;
+	u64 tx_sg_linearized;
+	u64 tx_queue_stops;
+	u64 tx_queue_wakes;
+	u64 tx_busy_retries;
+	u64 tx_timeouts;
+};
+
 struct pfe_eth_priv_s {
 	struct pfe *pfe;
 	struct hif_client_s client;
 
-	/* TMU Tx queue numbers this GEM's traffic is scheduled on -- only
-	 * ever passed to hif_lib_tmu_queue_start()/stop() (both no-ops,
-	 * see pfe_hif_lib.c), since this port's actual Tx submission
-	 * (hif_lib_xmit_pkt(), Stage P8) always uses a single fixed
-	 * client-level queue (PFE_ETH_TXQ in pfe_eth.c) instead of the
-	 * vendor's per-packet QoS classification into one of 16.
-	 */
 	int low_tmuQ;
 	int high_tmuQ;
 
 	struct net_device *dev;
 	struct device_node *of_node;
-	unsigned int id;		/* GEM id: 0, 1 or 2 */
+	unsigned int id;		/* GEM0: 0 */
 
 	spinlock_t lock;		/* protects oldspeed/oldduplex/oldlink below */
+	spinlock_t tx_clean_lock;	/* protects TX completion/BQL/stop-wake state */
+	unsigned int tx_wake_thres;
+	bool closing;
 
 	void __iomem *EMAC_baseaddr;
 	void __iomem *GPI_baseaddr;
@@ -62,7 +69,8 @@ struct pfe_eth_priv_s {
 	int oldduplex;
 	int oldlink;
 
-	struct mii_bus *mii_bus;	/* shared across all GEMs on this PFE */
+	struct mii_bus *mii_bus;
+	struct pfe_eth_sw_stats sw_stats;
 };
 
 int pfe_eth_init(struct pfe *pfe);
