@@ -31,10 +31,10 @@
  * Rx packet buffers are allocated as 2048-byte page fragments via
  * netdev_alloc_frag_align() (pfe_hif_buf_alloc()/_free()/_map()/
  * _unmap() in pfe_hif_lib.h) and mapped with streaming DMA
- * (dma_map_single(..., DMA_FROM_DEVICE)). Storing DMA metadata in the
- * first slot of PFE_PKT_HEADROOM keeps it on a separate cache line
- * from the packet payload and allows zero-copy build_skb() delivery in
- * pfe_eth.c.
+ * (dma_map_single(..., DMA_FROM_DEVICE)). Storing the bus address in
+ * the first slot of PFE_PKT_HEADROOM keeps DMA metadata on a separate
+ * cache line from the packet payload and allows zero-copy build_skb()
+ * delivery in pfe_eth.c.
  */
 
 #include <linux/bitops.h>
@@ -43,8 +43,6 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
-#include <linux/lockdep.h>
-#include <linux/log2.h>
 #include <linux/skbuff.h>
 #include <linux/string.h>
 
@@ -98,7 +96,7 @@ static void pfe_hif_free_descr(struct pfe_hif *hif)
 
 static void pfe_hif_unmap_tx_desc(struct pfe_hif *hif, struct hif_desc_sw *desc_sw)
 {
-	if (desc_sw->map_type == PFE_TX_MAP_NONE)
+	if (!desc_sw->data)
 		return;
 
 	if (desc_sw->map_type == PFE_TX_MAP_PAGE)
@@ -106,21 +104,8 @@ static void pfe_hif_unmap_tx_desc(struct pfe_hif *hif, struct hif_desc_sw *desc_
 	else if (desc_sw->map_type == PFE_TX_MAP_SINGLE)
 		dma_unmap_single(hif->dev, desc_sw->data, desc_sw->len, DMA_TO_DEVICE);
 
-	desc_sw->data = DMA_MAPPING_ERROR;
+	desc_sw->data = 0;
 	desc_sw->len = 0;
-	desc_sw->map_type = PFE_TX_MAP_NONE;
-}
-
-static void pfe_hif_reset_tx_desc_sw(struct hif_desc_sw *desc_sw)
-{
-	desc_sw->data = DMA_MAPPING_ERROR;
-	desc_sw->skb = NULL;
-	desc_sw->len = 0;
-	desc_sw->q_idx = 0;
-	desc_sw->client_id = HIF_CLIENTS_MAX;
-	desc_sw->q_no = 0;
-	desc_sw->chain_id = 0;
-	desc_sw->chain_token = 0;
 	desc_sw->map_type = PFE_TX_MAP_NONE;
 }
 
@@ -153,13 +138,12 @@ static void pfe_hif_release_buffers(struct pfe_hif *hif)
 		desc = hif->TxBase;
 		for (i = 0; i < hif->TxRingSize; i++) {
 			struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[i];
-			struct sk_buff *skb = desc_sw->skb;
 
-			desc_sw->skb = NULL;
 			pfe_hif_unmap_tx_desc(hif, desc_sw);
-			pfe_hif_reset_tx_desc_sw(desc_sw);
-			if (unlikely(skb))
-				dev_kfree_skb_any(skb);
+			if (unlikely(desc_sw->orphaned_skb)) {
+				dev_kfree_skb_any(desc_sw->orphaned_skb);
+				desc_sw->orphaned_skb = NULL;
+			}
 			desc->data = 0;
 			desc->status = 0;
 			desc->ctrl = 0;
@@ -175,7 +159,7 @@ static void pfe_hif_release_buffers(struct pfe_hif *hif)
 static int pfe_hif_init_buffers(struct pfe_hif *hif)
 {
 	struct hif_desc *desc;
-	dma_addr_t first_desc_p, tx_base_p;
+	dma_addr_t data, first_desc_p, tx_base_p;
 	int i;
 
 	if (hif->shm->rx_buf_pool_cnt < hif->RxRingSize)
@@ -189,9 +173,9 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 
 	for (i = 0; i < hif->RxRingSize; i++) {
 		u32 next_idx = (i + 1) & (hif->RxRingSize - 1);
-		void *buf = (void *)hif->shm->rx_buf_pool[i];
 
-		if (!pfe_hif_buf_map(hif->dev, buf)) {
+		data = pfe_hif_buf_map(hif->dev, (void *)hif->shm->rx_buf_pool[i]);
+		if (!data) {
 			while (i-- > 0) {
 				pfe_hif_buf_unmap(hif->dev, hif->rx_buf_addr[i]);
 				hif->shm->rx_buf_pool[i] = hif->rx_buf_addr[i];
@@ -199,10 +183,10 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 			}
 			return -ENOMEM;
 		}
-		hif->rx_buf_addr[i] = buf;
+		hif->rx_buf_addr[i] = (void *)hif->shm->rx_buf_pool[i];
 		hif->shm->rx_buf_pool[i] = NULL;
 
-		desc->data = lower_32_bits(pfe_hif_buf_dma(buf));
+		desc->data = lower_32_bits(data);
 		desc->status = 0;
 		desc->next = lower_32_bits(first_desc_p + next_idx * sizeof(struct hif_desc));
 		wmb();
@@ -212,7 +196,6 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 	}
 
 	hif->RxtocleanIndex = 0;
-	hif->rx_drop_pkt = false;
 
 	writel(lower_32_bits(first_desc_p), HIF_RX_BDP_ADDR);
 
@@ -220,8 +203,6 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 	tx_base_p = first_desc_p + hif->RxRingSize * sizeof(struct hif_desc);
 	memset(hif->TxBase, 0, hif->TxRingSize * sizeof(struct hif_desc));
 	memset(hif->tx_sw_queue, 0, sizeof(hif->tx_sw_queue));
-	for (i = 0; i < hif->TxRingSize; i++)
-		pfe_hif_reset_tx_desc_sw(&hif->tx_sw_queue[i]);
 
 	desc = hif->TxBase;
 	for (i = 0; i < hif->TxRingSize; i++) {
@@ -234,225 +215,10 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 	hif->TxAvail = hif->TxRingSize;
 	hif->Txtosend = 0;
 	hif->Txtoclean = 0;
-	hif->tx_chain_seq = 1;
 
 	writel(lower_32_bits(tx_base_p), HIF_TX_BDP_ADDR);
 
 	return 0;
-}
-
-static void pfe_hif_mark_client_orphaned(struct pfe_hif *hif, unsigned int client_id)
-{
-	unsigned int active = hif->TxRingSize - hif->TxAvail;
-	unsigned int i;
-
-	lockdep_assert_held(&hif->tx_lock);
-
-	for (i = 0; i < active; i++) {
-		unsigned int cur = (hif->Txtoclean + i) & (hif->TxRingSize - 1);
-
-		if (hif->tx_sw_queue[cur].client_id == client_id)
-			hif->tx_sw_queue[cur].client_id = HIF_CLIENTS_MAX;
-	}
-}
-
-/*
- * Prove that an entire orphaned SG packet chain starting at start_q_idx with
- * length chain_len is present in the active HIF TX window with a unique
- * non-zero chain_id and packet-unique chain_token, and that every descriptor
- * in the chain has completed HW DMA (!(ctrl & BD_CTRL_DESC_EN)) with
- * BD_CTRL_LIFM set only on the final descriptor.
- */
-static bool pfe_hif_orphan_chain_done(struct pfe_hif *hif,
-				      const struct hif_client_tx_queue *q,
-				      unsigned int start_q_idx,
-				      unsigned int chain_len)
-{
-	unsigned int active = hif->TxRingSize - hif->TxAvail;
-	unsigned int mask = q->size - 1;
-	unsigned int i;
-
-	if (!chain_len || chain_len > PFE_TX_MAX_SG_DESCS || chain_len > active)
-		return false;
-
-	for (i = 0; i + chain_len <= active; i++) {
-		unsigned int hw_idx = (hif->Txtoclean + i) & (hif->TxRingSize - 1);
-		struct hif_desc_sw *sw = &hif->tx_sw_queue[hw_idx];
-		u64 target_chain_id;
-		uintptr_t target_token;
-		unsigned int q_no, step;
-		bool valid_chain = true;
-
-		if (sw->client_id != HIF_CLIENTS_MAX ||
-		    !sw->chain_id ||
-		    !sw->chain_token ||
-		    sw->q_idx != start_q_idx)
-			continue;
-
-		target_chain_id = sw->chain_id;
-		target_token = sw->chain_token;
-		q_no = sw->q_no;
-
-		for (step = 0; step < chain_len; step++) {
-			unsigned int c_hw_idx = (hw_idx + step) & (hif->TxRingSize - 1);
-			struct hif_desc_sw *c_sw = &hif->tx_sw_queue[c_hw_idx];
-			struct hif_desc *c_hw = hif->TxBase + c_hw_idx;
-			u32 c_ctrl = READ_ONCE(c_hw->ctrl);
-			unsigned int exp_q_idx = (start_q_idx + step) & mask;
-			bool is_last = (step + 1 == chain_len);
-
-			if (c_sw->client_id != HIF_CLIENTS_MAX ||
-			    c_sw->chain_id != target_chain_id ||
-			    c_sw->chain_token != target_token ||
-			    c_sw->q_no != q_no ||
-			    c_sw->q_idx != exp_q_idx ||
-			    (c_ctrl & BD_CTRL_DESC_EN) ||
-			    (bool)(c_ctrl & BD_CTRL_LIFM) != is_last) {
-				valid_chain = false;
-				break;
-			}
-		}
-
-		if (valid_chain)
-			return true;
-	}
-
-	return false;
-}
-
-/*
- * Validate every descriptor in the full SG chain from q->read_idx through
- * the HIF_LAST_BUFFER descriptor and prove that every descriptor in that
- * chain has completed before advancing ack_idx, read_idx, or tx_pending.
- */
-static void pfe_hif_orphan_sync_client_queue(struct pfe_hif *hif,
-					     struct hif_client_tx_queue *q)
-{
-	unsigned int mask, chain_len = 0, step;
-	bool found_last = false;
-
-	if (!q || !q->base || !q->size || !is_power_of_2(q->size) || !q->tx_pending)
-		return;
-
-	if (q->ack_idx != q->read_idx)
-		return;
-
-	mask = q->size - 1;
-
-	for (step = 0; step < q->tx_pending && step < PFE_TX_MAX_SG_DESCS; step++) {
-		unsigned int q_idx = (q->read_idx + step) & mask;
-		struct tx_queue_desc *q_desc = q->base + q_idx;
-		u32 q_ctrl = READ_ONCE(q_desc->ctrl);
-		u32 desc_flags = CL_DESC_GET_FLAGS(q_ctrl);
-
-		if (step == 0 && !(desc_flags & HIF_FIRST_BUFFER))
-			return;
-		if (step > 0 && (desc_flags & HIF_FIRST_BUFFER))
-			return;
-
-		if (desc_flags & HIF_LAST_BUFFER) {
-			if (!(desc_flags & HIF_DATA_VALID))
-				return;
-			chain_len = step + 1;
-			found_last = true;
-			break;
-		}
-
-		if (desc_flags & HIF_DATA_VALID)
-			return;
-	}
-
-	if (!found_last || !chain_len)
-		return;
-
-	if (!pfe_hif_orphan_chain_done(hif, q, q->read_idx, chain_len))
-		return;
-
-	for (step = 0; step < chain_len; step++) {
-		unsigned int q_idx = (q->read_idx + step) & mask;
-		struct tx_queue_desc *q_desc = q->base + q_idx;
-
-		q_desc->data = NULL;
-		smp_wmb();
-		WRITE_ONCE(q_desc->ctrl, 0);
-	}
-
-	q->ack_idx = (q->read_idx + chain_len) & mask;
-	q->read_idx = (q->read_idx + chain_len) & mask;
-	q->tx_pending -= chain_len;
-}
-
-static bool pfe_hif_has_orphaned_tx(struct pfe_hif *hif, int ttc, int tx_avl)
-{
-	int active = hif->TxRingSize - tx_avl;
-	int i;
-
-	for (i = 0; i < active; i++) {
-		unsigned int cur = (ttc + i) & (hif->TxRingSize - 1);
-
-		if (hif->tx_sw_queue[cur].client_id == HIF_CLIENTS_MAX)
-			return true;
-	}
-
-	return false;
-}
-
-/*
- * Drain contiguous completed orphaned descriptors from Txtoclean: unmaps
- * DMA, releases skb once, resets desc_sw to a clean reusable state, and
- * advances Txtoclean / TxAvail together. Synchronizes any complete orphaned
- * client queue chain afterward and schedules NAPI if orphaned descriptors
- * remain in flight. Returns the number of drained descriptors.
- */
-static unsigned int pfe_hif_drain_orphaned_tx(struct pfe_hif *hif,
-					      struct hif_client_tx_queue *q)
-{
-	int ttc, tx_avl;
-	unsigned int drained = 0;
-
-	lockdep_assert_held(&hif->tx_lock);
-
-	ttc = hif->Txtoclean;
-	tx_avl = hif->TxAvail;
-
-	while (tx_avl < hif->TxRingSize) {
-		struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[ttc];
-		struct hif_desc *desc = hif->TxBase + ttc;
-		struct sk_buff *skb;
-
-		if (desc_sw->client_id != HIF_CLIENTS_MAX)
-			break;
-
-		if (READ_ONCE(desc->ctrl) & BD_CTRL_DESC_EN)
-			break;
-
-		dma_rmb();
-
-		skb = desc_sw->skb;
-		desc_sw->skb = NULL;
-		if (unlikely(skb))
-			dev_kfree_skb_any(skb);
-
-		pfe_hif_unmap_tx_desc(hif, desc_sw);
-		pfe_hif_reset_tx_desc_sw(desc_sw);
-		desc->data = 0;
-		desc->status = 0;
-		WRITE_ONCE(desc->ctrl, 0);
-
-		inc_hif_txidx(ttc);
-		tx_avl++;
-		drained++;
-	}
-
-	hif->Txtoclean = ttc;
-	hif->TxAvail = tx_avl;
-
-	pfe_hif_orphan_sync_client_queue(hif, q);
-
-	if (pfe_hif_has_orphaned_tx(hif, ttc, tx_avl) && hif->dummy_dev)
-		napi_schedule(&hif->napi);
-
-	return drained;
 }
 
 static int pfe_hif_client_register(struct pfe_hif *hif, u32 client_id,
@@ -503,6 +269,8 @@ static int pfe_hif_client_register(struct pfe_hif *hif, u32 client_id,
 
 static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 {
+	unsigned int active, i;
+
 	spin_lock_bh(&hif->lock);
 	spin_lock_bh(&hif->tx_lock);
 
@@ -511,8 +279,19 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 	} else {
 		hif->shm->gClient_status &= ~(1 << client_id);
 		memset(&hif->client[client_id], 0, sizeof(hif->client[client_id]));
-		pfe_hif_mark_client_orphaned(hif, client_id);
-		pfe_hif_drain_orphaned_tx(hif, NULL);
+
+		/*
+		 * Orphan any in-flight Tx descriptors belonging to this client
+		 * so late completions still unmap DMA buffers without touching
+		 * a future session's tx_q.
+		 */
+		active = hif->TxRingSize - hif->TxAvail;
+		for (i = 0; i < active; i++) {
+			unsigned int cur = (hif->Txtoclean + i) & (hif->TxRingSize - 1);
+
+			if (hif->tx_sw_queue[cur].client_id == client_id)
+				hif->tx_sw_queue[cur].client_id = HIF_CLIENTS_MAX;
+		}
 	}
 
 	spin_unlock_bh(&hif->tx_lock);
@@ -522,96 +301,60 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 }
 
 /*
- * Atomically retire only complete, contiguous SG chains on a closing client
- * queue after proving full packet-chain identity (chain_id, chain_token,
- * q_no, sequential q_idx) and completion across all descriptors in the chain:
- *  - Marks client descriptors orphaned and drains already-completed chains
- *    first.
- *  - For any remaining pending chain starting at q->read_idx, verifies every
- *    descriptor in the chain from HIF_FIRST_BUFFER to HIF_LAST_BUFFER has
- *    !(q_ctrl & CL_DESC_OWN) and is completed on the matching hardware chain
- *    via pfe_hif_orphan_chain_done().
- *  - If any descriptor in a chain is still in flight or does not match a
- *    complete packet chain, stops atomically so tx_pending, read_idx, and
- *    ack_idx are not partially or wrongly updated.
+ * Detach remaining in-flight TX descriptors and skbs from a closing client
+ * queue so late TX completions release DMA/skb resources safely without
+ * referencing a reopened client session.
  */
 void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 			      struct hif_client_tx_queue *q)
 {
-	unsigned int mask;
+	unsigned int active, idx, i = 0;
 
-	lockdep_assert_held(&hif->tx_lock);
-
-	if (unlikely(!q || !q->base || !q->size || !is_power_of_2(q->size)))
+	if (unlikely(!q || !q->base))
 		return;
 
-	mask = q->size - 1;
-	pfe_hif_mark_client_orphaned(hif, client_id);
-	pfe_hif_drain_orphaned_tx(hif, q);
+	active = hif->TxRingSize - hif->TxAvail;
+	idx = hif->Txtoclean;
 
 	while (q->tx_pending) {
-		unsigned int chain_len = 0, step;
-		bool found_last = false, all_client_free = true;
-		struct sk_buff *chain_skb = NULL;
+		struct tx_queue_desc *q_desc = q->base + q->read_idx;
+		struct sk_buff *skb = q_desc->data;
+		u32 q_ctrl = READ_ONCE(q_desc->ctrl);
+		bool has_skb = skb && (CL_DESC_GET_FLAGS(q_ctrl) & HIF_DATA_VALID);
+		bool attached = false;
 
-		if (q->ack_idx != q->read_idx)
-			break;
+		if (q_ctrl & CL_DESC_OWN) {
+			while (i < active) {
+				unsigned int cur = (idx + i) & (hif->TxRingSize - 1);
+				struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[cur];
 
-		for (step = 0; step < q->tx_pending && step < PFE_TX_MAX_SG_DESCS; step++) {
-			unsigned int q_idx = (q->read_idx + step) & mask;
-			struct tx_queue_desc *q_desc = q->base + q_idx;
-			u32 q_ctrl = READ_ONCE(q_desc->ctrl);
-			u32 desc_flags = CL_DESC_GET_FLAGS(q_ctrl);
+				i++;
+				if (desc_sw->client_id != client_id)
+					continue;
 
-			if (step == 0 && !(desc_flags & HIF_FIRST_BUFFER))
-				return;
-			if (step > 0 && (desc_flags & HIF_FIRST_BUFFER))
-				return;
-
-			if (q_ctrl & CL_DESC_OWN) {
-				all_client_free = false;
+				desc_sw->client_id = HIF_CLIENTS_MAX;
+				if (has_skb) {
+					desc_sw->orphaned_skb = skb;
+					attached = true;
+				}
 				break;
 			}
-
-			if (q_desc->data) {
-				if (chain_skb && chain_skb != q_desc->data)
-					return;
-				chain_skb = q_desc->data;
-			}
-
-			if (desc_flags & HIF_LAST_BUFFER) {
-				if (!(desc_flags & HIF_DATA_VALID))
-					return;
-				chain_len = step + 1;
-				found_last = true;
-				break;
-			}
-
-			if (desc_flags & HIF_DATA_VALID)
-				return;
 		}
 
-		if (!all_client_free || !found_last || !chain_len)
-			break;
+		if (has_skb && !attached)
+			dev_kfree_skb_any(skb);
 
-		if (!pfe_hif_orphan_chain_done(hif, q, q->read_idx, chain_len))
-			break;
+		q_desc->data = NULL;
+		WRITE_ONCE(q_desc->ctrl, 0);
+		q->read_idx = (q->read_idx + 1) & (q->size - 1);
+		q->tx_pending--;
+	}
 
-		for (step = 0; step < chain_len; step++) {
-			unsigned int q_idx = (q->read_idx + step) & mask;
-			struct tx_queue_desc *q_desc = q->base + q_idx;
+	for (; i < active; i++) {
+		unsigned int cur = (idx + i) & (hif->TxRingSize - 1);
 
-			q_desc->data = NULL;
-			smp_wmb();
-			WRITE_ONCE(q_desc->ctrl, 0);
-		}
-
-		q->ack_idx = (q->read_idx + chain_len) & mask;
-		q->read_idx = (q->read_idx + chain_len) & mask;
-		q->tx_pending -= chain_len;
-
-		if (chain_skb)
-			dev_kfree_skb_any(chain_skb);
+		if (hif->tx_sw_queue[cur].client_id == client_id)
+			hif->tx_sw_queue[cur].client_id = HIF_CLIENTS_MAX;
 	}
 }
 
@@ -656,53 +399,21 @@ static void *client_put_rxpacket(struct pfe_hif *hif, void *pkt, u32 len, u32 fl
 	return free_pkt;
 }
 
-static bool pfe_hif_rx_arm_desc(struct pfe_hif *hif, int rtc, void *buf)
-{
-	struct hif_desc *desc = hif->RxBase + rtc;
-
-	if (!pfe_hif_buf_is_mapped(buf) && !pfe_hif_buf_map(hif->dev, buf)) {
-		void *alt_buf = pfe_hif_spare_buf_get();
-
-		if (!alt_buf || !pfe_hif_buf_map(hif->dev, alt_buf)) {
-			if (alt_buf)
-				pfe_hif_spare_buf_put(alt_buf);
-			hif->rx_buf_addr[rtc] = buf;
-			desc->data = 0;
-			wmb();
-			desc->ctrl = 0;
-			return false;
-		}
-
-		pfe_hif_spare_buf_put(buf);
-		buf = alt_buf;
-	}
-
-	hif->rx_buf_addr[rtc] = buf;
-	desc->data = lower_32_bits(pfe_hif_buf_dma(buf));
-	wmb();
-	desc->ctrl = BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM | BD_CTRL_DIR |
-		     BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size);
-
-	return true;
-}
-
 /*
  * Dequeues HIF Rx descriptors and hands completed packets to the owning
  * client's Rx queue. NAPI poll function.
  */
-static int pfe_hif_rx_process(struct pfe_hif *hif, int budget, bool *remap_stalled_out)
+static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 {
 	struct hif_hdr pkt_hdr;
 	void *pkt_hdr_ptr;
 	void *free_buf;
 	int rtc, len, rx_processed = 0;
 	bool retried_full = false;
-	bool remap_stalled = false;
+	bool drop_pkt = false;
 	struct hif_desc *desc;
 	u32 ctrl;
 	int flags;
-
-	*remap_stalled_out = false;
 
 	spin_lock_bh(&hif->lock);
 
@@ -712,20 +423,6 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget, bool *remap_stall
 		bool queue_full;
 
 		desc = hif->RxBase + rtc;
-		pkt_hdr_ptr = hif->rx_buf_addr[rtc];
-
-		/*
-		 * Retry arming a descriptor whose buffer could not be mapped on
-		 * a previous poll before inspecting BD_CTRL_DESC_EN.
-		 */
-		if (unlikely(!pfe_hif_buf_is_mapped(pkt_hdr_ptr))) {
-			if (!pfe_hif_rx_arm_desc(hif, rtc, pkt_hdr_ptr)) {
-				remap_stalled = true;
-				break;
-			}
-			inc_hif_rxidx(rtc);
-			continue;
-		}
 
 		ctrl = READ_ONCE(desc->ctrl);
 		if (ctrl & BD_CTRL_DESC_EN) {
@@ -742,6 +439,7 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget, bool *remap_stall
 
 		len = BD_BUF_LEN(ctrl);
 
+		pkt_hdr_ptr = hif->rx_buf_addr[rtc];
 		pfe_hif_buf_unmap(hif->dev, pkt_hdr_ptr);
 
 		/* Track the last HIF header received, for multi-buffer packets. */
@@ -759,9 +457,9 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget, bool *remap_stall
 		if (ctrl & BD_CTRL_LIFM)
 			flags |= CL_DESC_LAST;
 
-		if (hif->rx_drop_pkt) {
+		if (drop_pkt) {
 			if (ctrl & BD_CTRL_LIFM) {
-				hif->rx_drop_pkt = false;
+				drop_pkt = false;
 				hif->started = 0;
 			}
 			free_buf = pkt_hdr_ptr;
@@ -775,7 +473,7 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget, bool *remap_stall
 			if (ctrl & BD_CTRL_LIFM)
 				hif->started = 0;
 			else
-				hif->rx_drop_pkt = true;
+				drop_pkt = true;
 			free_buf = pkt_hdr_ptr;
 			goto pkt_drop;
 		}
@@ -817,7 +515,7 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget, bool *remap_stall
 			if (flags & CL_DESC_FIRST)
 				hif->started = 0;
 			if (!(ctrl & BD_CTRL_LIFM))
-				hif->rx_drop_pkt = true;
+				drop_pkt = true;
 			free_buf = pkt_hdr_ptr;
 			goto pkt_drop;
 		}
@@ -825,14 +523,18 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget, bool *remap_stall
 		retried_full = false;
 
 pkt_drop:
-		if (unlikely(!pfe_hif_rx_arm_desc(hif, rtc, free_buf))) {
+		hif->rx_buf_addr[rtc] = free_buf;
+		/* The drop path re-posts the (now unmapped) buffer itself. */
+		if (!pfe_hif_buf_dma(free_buf) && !pfe_hif_buf_map(hif->dev, free_buf)) {
 			WARN_ON_ONCE(1);
-			if (ctrl & BD_CTRL_LIFM) {
-				hif->rx_drop_pkt = false;
-				hif->started = 0;
-			}
-			remap_stalled = true;
-			break;
+			desc->data = 0;
+			wmb();
+			desc->ctrl = 0;	/* leave it disabled rather than DMA to 0 */
+		} else {
+			desc->data = lower_32_bits(pfe_hif_buf_dma(free_buf));
+			wmb();
+			desc->ctrl = BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM | BD_CTRL_DIR |
+				     BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size);
 		}
 
 		inc_hif_rxidx(rtc);
@@ -857,87 +559,39 @@ pkt_drop:
 	hif->RxtocleanIndex = rtc;
 	spin_unlock_bh(&hif->lock);
 
-	*remap_stalled_out = remap_stalled;
-	if (!remap_stalled)
-		hif_rx_dma_start();
+	/* We made progress; re-start Rx DMA in case it stopped. */
+	hif_rx_dma_start();
 
-	return remap_stalled ? budget : rx_processed;
+	return rx_processed;
 }
 
-/*
- * Validate client TX descriptor position and ownership before transferring
- * skb ownership from HIF (desc_sw->skb, CL_DESC_OWN set) to the client ring
- * (desc->data, CL_DESC_OWN clear). On validation failure, leaves client
- * descriptor state untouched and returns an error so the caller can release
- * the skb once and advance ring reclamation without blocking on a stale
- * descriptor.
- */
-static int client_ack_txpacket(struct pfe_hif *hif, unsigned int client_id,
-			       unsigned int q_no, unsigned int q_idx,
-			       struct sk_buff *skb)
+static int client_ack_txpacket(struct pfe_hif *hif, unsigned int client_id, unsigned int q_no)
 {
 	struct hif_tx_queue *queue;
 	struct tx_queue_desc *desc;
-	u32 q_ctrl, desc_flags;
+	u32 q_ctrl;
 
 	if (unlikely(client_id >= HIF_CLIENTS_MAX ||
 		     !(hif->shm->gClient_status & (1 << client_id)) ||
-		     q_no >= hif->client[client_id].tx_qn)) {
-		dev_err_ratelimited(hif->dev,
-				    "%s: invalid client %u or q %u\n",
-				    __func__, client_id, q_no);
-		return -EINVAL;
-	}
+		     q_no >= hif->client[client_id].tx_qn))
+		return 0;
 
 	queue = &hif->client[client_id].tx_q[q_no];
-	if (unlikely(!queue->base || !queue->size ||
-		     !is_power_of_2(queue->size) || q_idx >= queue->size)) {
-		dev_err_ratelimited(hif->dev,
-				    "%s: invalid queue state for client %u q %u idx %u\n",
-				    __func__, client_id, q_no, q_idx);
-		return -EINVAL;
-	}
+	if (unlikely(!queue->base))
+		return 0;
 
-	if (unlikely(queue->ack_idx != q_idx)) {
-		dev_err_ratelimited(hif->dev,
-				    "%s: stale/out-of-order q_idx %u (expected ack_idx %u) for client %u q %u\n",
-				    __func__, q_idx, queue->ack_idx, client_id, q_no);
-		return -ERANGE;
-	}
-
-	desc = queue->base + q_idx;
+	desc = queue->base + queue->ack_idx;
 	q_ctrl = READ_ONCE(desc->ctrl);
 
-	if (unlikely(!(q_ctrl & CL_DESC_OWN))) {
-		dev_err_ratelimited(hif->dev,
-				    "%s: client %u q %u idx %u not owned by HIF (ctrl=%#x)\n",
-				    __func__, client_id, q_no, q_idx, q_ctrl);
+	if (!(q_ctrl & CL_DESC_OWN)) {
+		dev_err(hif->dev, "%s: unexpected: %d %d %d %d %d %p %d\n", __func__,
+			hif->Txtosend, hif->Txtoclean, hif->TxAvail, client_id, q_no,
+			queue, queue->ack_idx);
 		return -EINVAL;
 	}
 
-	desc_flags = CL_DESC_GET_FLAGS(q_ctrl);
-	if (skb) {
-		if (unlikely((desc_flags & (HIF_LAST_BUFFER | HIF_DATA_VALID)) !=
-			     (HIF_LAST_BUFFER | HIF_DATA_VALID) || desc->data)) {
-			dev_err_ratelimited(hif->dev,
-					    "%s: client %u q %u idx %u final desc mismatch (ctrl=%#x data=%p)\n",
-					    __func__, client_id, q_no, q_idx, q_ctrl, desc->data);
-			return -EILSEQ;
-		}
-	} else {
-		if (unlikely((desc_flags & (HIF_LAST_BUFFER | HIF_DATA_VALID)) ||
-			     desc->data)) {
-			dev_err_ratelimited(hif->dev,
-					    "%s: client %u q %u idx %u non-final desc mismatch (ctrl=%#x data=%p)\n",
-					    __func__, client_id, q_no, q_idx, q_ctrl, desc->data);
-			return -EILSEQ;
-		}
-	}
-
-	desc->data = skb;
-	smp_wmb();
 	WRITE_ONCE(desc->ctrl, q_ctrl & ~CL_DESC_OWN);
-	queue->ack_idx = (q_idx + 1) & (queue->size - 1);
+	queue->ack_idx = (queue->ack_idx + 1) & (queue->size - 1);
 
 	return 0;
 }
@@ -952,9 +606,6 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 	tx_avl = hif->TxAvail;
 
 	while (tx_avl < hif->TxRingSize && count--) {
-		struct sk_buff *skb;
-		int ack_err = 0;
-
 		desc = hif->TxBase + ttc;
 		if (READ_ONCE(desc->ctrl) & BD_CTRL_DESC_EN)
 			break;
@@ -962,19 +613,13 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 		dma_rmb();
 
 		desc_sw = &hif->tx_sw_queue[ttc];
-		skb = desc_sw->skb;
-
-		if (desc_sw->client_id < HIF_CLIENTS_MAX)
-			ack_err = client_ack_txpacket(hif, desc_sw->client_id,
-							desc_sw->q_no, desc_sw->q_idx,
-							skb);
-
-		desc_sw->skb = NULL;
-		if (unlikely(ack_err) && skb)
-			dev_kfree_skb_any(skb);
-
 		pfe_hif_unmap_tx_desc(hif, desc_sw);
-		pfe_hif_reset_tx_desc_sw(desc_sw);
+		if (unlikely(desc_sw->orphaned_skb)) {
+			dev_kfree_skb_any(desc_sw->orphaned_skb);
+			desc_sw->orphaned_skb = NULL;
+		}
+
+		client_ack_txpacket(hif, desc_sw->client_id, desc_sw->q_no);
 
 		inc_hif_txidx(ttc);
 		tx_avl++;
@@ -994,8 +639,6 @@ int __hif_xmit_pkt_sg(struct pfe_hif *hif, unsigned int client_id, unsigned int 
 {
 	struct hif_desc *first_desc;
 	u32 first_ctrl = 0;
-	u64 chain_id;
-	uintptr_t chain_token = 0;
 	unsigned int start_idx, i;
 
 	if (unlikely(!nr_descs || nr_descs > hif->TxRingSize))
@@ -1006,19 +649,6 @@ int __hif_xmit_pkt_sg(struct pfe_hif *hif, unsigned int client_id, unsigned int 
 		if (hif->TxAvail < nr_descs)
 			return -EBUSY;
 	}
-
-	chain_id = hif->tx_chain_seq++;
-	if (unlikely(!chain_id))
-		chain_id = hif->tx_chain_seq++;
-
-	for (i = 0; i < nr_descs; i++) {
-		if (segs[i].skb) {
-			chain_token = (uintptr_t)segs[i].skb;
-			break;
-		}
-	}
-	if (!chain_token)
-		chain_token = (uintptr_t)chain_id;
 
 	start_idx = hif->Txtosend;
 	first_desc = hif->TxBase + start_idx;
@@ -1031,13 +661,10 @@ int __hif_xmit_pkt_sg(struct pfe_hif *hif, unsigned int client_id, unsigned int 
 		u32 ctrl = BD_BUF_LEN(segs[i].len);
 
 		desc_sw->data = segs[i].dma;
-		desc_sw->skb = is_last ? segs[i].skb : NULL;
+		desc_sw->orphaned_skb = NULL;
 		desc_sw->len = segs[i].len;
-		desc_sw->q_idx = segs[i].q_idx;
 		desc_sw->client_id = client_id;
 		desc_sw->q_no = q_no;
-		desc_sw->chain_id = chain_id;
-		desc_sw->chain_token = chain_token;
 		desc_sw->map_type = segs[i].map_type;
 
 		desc->data = lower_32_bits(segs[i].dma);
@@ -1189,17 +816,14 @@ static void pfe_hif_tx_poll_notify(struct pfe_hif *hif)
 static int pfe_hif_rx_poll(struct napi_struct *napi, int budget)
 {
 	struct pfe_hif *hif = container_of(napi, struct pfe_hif, napi);
-	bool remap_stalled = false;
 	int work_done;
 
 	hif->napi_counters[NAPI_POLL_COUNT]++;
 
-	work_done = pfe_hif_rx_process(hif, budget, &remap_stalled);
+	work_done = pfe_hif_rx_process(hif, budget);
 	pfe_hif_tx_poll_notify(hif);
 
-	if (remap_stalled) {
-		hif->napi_counters[NAPI_REMAP_STALLED_COUNT]++;
-	} else if (work_done < budget) {
+	if (work_done < budget) {
 		unsigned long flags;
 
 		spin_lock_irqsave(&hif->irq_lock, flags);

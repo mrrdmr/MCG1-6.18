@@ -20,7 +20,6 @@
 #ifndef _PFE_HIF_LIB_H_
 #define _PFE_HIF_LIB_H_
 
-#include <linux/build_bug.h>
 #include <linux/dma-mapping.h>
 #include <linux/netdevice.h>
 
@@ -133,39 +132,15 @@ extern unsigned int pfe_pkt_headroom;
 
 #define PFE_BUF_ALIGN		128U
 
-struct pfe_hif_buf_meta {
-	dma_addr_t dma;
-	bool mapped;
-};
-
-static inline struct pfe_hif_buf_meta *pfe_hif_buf_meta(void *pkt)
-{
-	return (struct pfe_hif_buf_meta *)((u8 *)pkt - PFE_PKT_HEADROOM);
-}
-
-/* Bus address of the current RX mapping (valid only when mapped == true). */
-static inline dma_addr_t pfe_hif_buf_dma(void *pkt)
-{
-	return pfe_hif_buf_meta(pkt)->dma;
-}
-
-static inline bool pfe_hif_buf_is_mapped(void *pkt)
-{
-	return pfe_hif_buf_meta(pkt)->mapped;
-}
-
 /* Allocate a 2048-byte page fragment and return the packet data pointer
  * past PFE_PKT_HEADROOM, using the first headroom slot for RX DMA state.
  */
 static inline void *pfe_hif_buf_alloc(struct device *dev, gfp_t flags)
 {
-	struct pfe_hif_buf_meta *meta;
 	void *base;
 
 	(void)dev;
 	(void)flags;
-
-	BUILD_BUG_ON(sizeof(*meta) > PFE_PKT_HEADROOM);
 
 	/* Second argument to netdev_alloc_frag_align() is the alignment
 	 * itself, which must be a power of two -- it is converted to the
@@ -175,64 +150,50 @@ static inline void *pfe_hif_buf_alloc(struct device *dev, gfp_t flags)
 	if (!base)
 		return NULL;
 
-	meta = base;
-	meta->dma = DMA_MAPPING_ERROR;
-	meta->mapped = false;
+	*(dma_addr_t *)base = 0;
 
-	return (u8 *)base + PFE_PKT_HEADROOM;
+	return base + PFE_PKT_HEADROOM;
 }
 
-/* Map the packet area for the HIF to write into; store the bus address and
- * explicit mapping state in the headroom slot without treating 0 as invalid.
- */
-static inline bool pfe_hif_buf_map(struct device *dev, void *pkt)
-{
-	struct pfe_hif_buf_meta *meta = pfe_hif_buf_meta(pkt);
-	dma_addr_t dma;
-
-	if (unlikely(meta->mapped))
-		return true;
-
-	dma = dma_map_single(dev, pkt, PFE_PKT_SIZE, DMA_FROM_DEVICE);
-	if (unlikely(dma_mapping_error(dev, dma))) {
-		meta->dma = DMA_MAPPING_ERROR;
-		meta->mapped = false;
-		return false;
-	}
-
-	meta->dma = dma;
-	meta->mapped = true;
-
-	return true;
-}
-
-/* Unmap the active RX DMA mapping and clear the stored headroom state. */
-static inline void pfe_hif_buf_unmap(struct device *dev, void *pkt)
-{
-	struct pfe_hif_buf_meta *meta = pfe_hif_buf_meta(pkt);
-
-	if (!meta->mapped)
-		return;
-
-	dma_unmap_single(dev, meta->dma, PFE_PKT_SIZE, DMA_FROM_DEVICE);
-	meta->dma = DMA_MAPPING_ERROR;
-	meta->mapped = false;
-}
-
-/* Unmap if still mapped and release an RX buffer back to the page-fragment
- * allocator.
- */
+/* Release an RX buffer back to the page-fragment allocator. */
 static inline void pfe_hif_buf_free(struct device *dev, void *pkt)
 {
-	if (unlikely(!pkt))
-		return;
+	(void)dev;
 
-	if (dev)
-		pfe_hif_buf_unmap(dev, pkt);
-	else
-		WARN_ON_ONCE(pfe_hif_buf_is_mapped(pkt));
+	if (likely(pkt))
+		skb_free_frag(pkt - PFE_PKT_HEADROOM);
+}
 
-	skb_free_frag((u8 *)pkt - PFE_PKT_HEADROOM);
+/* Map the packet area for the HIF to write into; store the bus address in
+ * the headroom slot so unmap/reuse helpers do not require a separate copy.
+ */
+static inline dma_addr_t pfe_hif_buf_map(struct device *dev, void *pkt)
+{
+	dma_addr_t dma = dma_map_single(dev, pkt, PFE_PKT_SIZE, DMA_FROM_DEVICE);
+
+	if (dma_mapping_error(dev, dma))
+		return 0;
+
+	*(dma_addr_t *)(pkt - PFE_PKT_HEADROOM) = dma;
+
+	return dma;
+}
+
+/* Bus address of the current RX mapping (0 if unmapped). */
+static inline dma_addr_t pfe_hif_buf_dma(void *pkt)
+{
+	return *(dma_addr_t *)(pkt - PFE_PKT_HEADROOM);
+}
+
+/* Unmap the active RX DMA mapping and clear the stored headroom address. */
+static inline void pfe_hif_buf_unmap(struct device *dev, void *pkt)
+{
+	dma_addr_t *slot = pkt - PFE_PKT_HEADROOM;
+
+	if (*slot) {
+		dma_unmap_single(dev, *slot, PFE_PKT_SIZE, DMA_FROM_DEVICE);
+		*slot = 0;
+	}
 }
 
 void *pfe_hif_spare_buf_get(void);

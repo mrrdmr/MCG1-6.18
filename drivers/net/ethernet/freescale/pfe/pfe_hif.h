@@ -35,7 +35,6 @@ enum {
 	NAPI_DESC_COUNT,
 	NAPI_FULL_BUDGET_COUNT,
 	NAPI_CLIENT_FULL_COUNT,
-	NAPI_REMAP_STALLED_COUNT,
 	NAPI_MAX_COUNT
 };
 
@@ -106,15 +105,14 @@ enum pfe_tx_map_type {
 	PFE_TX_MAP_PAGE,
 };
 
-/* Software tracking state per TX descriptor; skb is populated only on the
- * final descriptor of a packet while in flight in hardware and cleared once
- * handed over to the client TX ring (or freed directly if orphaned).
+/* Software tracking state per TX descriptor; orphaned_skb holds an skb
+ * whose descriptors remain in flight past interface teardown so late
+ * completions can free it without touching a subsequent session's queue.
  */
 struct hif_desc_sw {
 	dma_addr_t data;
-	struct sk_buff *skb;
+	struct sk_buff *orphaned_skb;
 	u16 len;
-	u16 q_idx;
 	u8 client_id;
 	u8 q_no;
 	u8 map_type;
@@ -122,9 +120,7 @@ struct hif_desc_sw {
 
 struct pfe_tx_sg_seg {
 	dma_addr_t dma;
-	struct sk_buff *skb;
 	u16 len;
-	u16 q_idx;
 	u8 map_type;
 };
 
@@ -176,7 +172,6 @@ struct pfe_hif {
 	unsigned int client_id;
 	unsigned int client_ctrl;
 	unsigned int started;
-	bool rx_drop_pkt;
 
 	struct hif_desc *TxBase;
 	u32 TxRingSize;
