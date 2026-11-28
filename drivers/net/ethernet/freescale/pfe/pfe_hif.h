@@ -155,6 +155,7 @@ struct hif_tso_hdr {
 
 /* Lock hierarchy:
  *  - tx_clean_lock (pfe_eth) -> hif->tx_lock (BH)
+ *  - tx_clean_lock (pfe_eth) -> hif->irq_lock (leaf)
  *  - hif->lock -> hif->tx_lock (BH)
  *  - hif->irq_lock is a leaf lock guarding HIF_INT_ENABLE and tx_irq_clients.
  */
@@ -220,11 +221,6 @@ static inline void hif_tx_lock(struct pfe_hif *hif)
 static inline void hif_tx_unlock(struct pfe_hif *hif)
 {
 	spin_unlock_bh(&hif->tx_lock);
-}
-
-static inline int __hif_tx_avail(struct pfe_hif *hif)
-{
-	return hif->TxAvail;
 }
 
 #endif /* _PFE_HIF_H_ */

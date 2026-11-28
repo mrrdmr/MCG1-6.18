@@ -19,6 +19,7 @@
 #ifndef _PFE_HIF_LIB_H_
 #define _PFE_HIF_LIB_H_
 
+#include <linux/bitops.h>
 #include <linux/dma-mapping.h>
 #include <linux/netdevice.h>
 
@@ -99,9 +100,9 @@ struct hif_shm {
 	struct hif_client_shm client[HIF_CLIENTS_MAX];
 };
 
-#define CL_DESC_OWN		(1 << 31) /* Ownership: set = HIF driver owns it */
-#define CL_DESC_LAST		(1 << 30)
-#define CL_DESC_FIRST		(1 << 29)
+#define CL_DESC_OWN		BIT(31) /* Ownership: set = HIF driver owns it */
+#define CL_DESC_LAST		BIT(30)
+#define CL_DESC_FIRST		BIT(29)
 #define CL_DESC_BUF_LEN(x)	((x) & 0xFFFF)
 #define CL_DESC_FLAGS(x)	(((x) & 0xF) << 16)
 #define CL_DESC_GET_FLAGS(x)	(((x) >> 16) & 0xF)
@@ -162,9 +163,15 @@ static inline void *pfe_hif_buf_alloc(struct device *dev)
 	if (!base)
 		return NULL;
 
-	*(dma_addr_t *)base = 0;
+	*(dma_addr_t *)base = DMA_MAPPING_ERROR;
 
 	return base + PFE_PKT_HEADROOM;
+}
+
+/* Bus address of the current RX mapping (DMA_MAPPING_ERROR if unmapped). */
+static inline dma_addr_t pfe_hif_buf_dma(void *pkt)
+{
+	return *(dma_addr_t *)(pkt - PFE_PKT_HEADROOM);
 }
 
 /* Release an RX buffer back to the page-fragment allocator. */
@@ -172,8 +179,10 @@ static inline void pfe_hif_buf_free(struct device *dev, void *pkt)
 {
 	(void)dev;
 
-	if (likely(pkt))
+	if (likely(pkt)) {
+		WARN_ON_ONCE(pfe_hif_buf_dma(pkt) != DMA_MAPPING_ERROR);
 		skb_free_frag(pkt - PFE_PKT_HEADROOM);
+	}
 }
 
 /* Map the packet area for the HIF to write into; store the bus address in
@@ -183,18 +192,14 @@ static inline dma_addr_t pfe_hif_buf_map(struct device *dev, void *pkt)
 {
 	dma_addr_t dma = dma_map_single(dev, pkt, PFE_PKT_SIZE, DMA_FROM_DEVICE);
 
-	if (dma_mapping_error(dev, dma))
+	if (dma_mapping_error(dev, dma)) {
+		*(dma_addr_t *)(pkt - PFE_PKT_HEADROOM) = DMA_MAPPING_ERROR;
 		return 0;
+	}
 
 	*(dma_addr_t *)(pkt - PFE_PKT_HEADROOM) = dma;
 
 	return dma;
-}
-
-/* Bus address of the current RX mapping (0 if unmapped). */
-static inline dma_addr_t pfe_hif_buf_dma(void *pkt)
-{
-	return *(dma_addr_t *)(pkt - PFE_PKT_HEADROOM);
 }
 
 /* Unmap the active RX DMA mapping and clear the stored headroom address. */
@@ -202,9 +207,9 @@ static inline void pfe_hif_buf_unmap(struct device *dev, void *pkt)
 {
 	dma_addr_t *slot = pkt - PFE_PKT_HEADROOM;
 
-	if (*slot) {
+	if (*slot != DMA_MAPPING_ERROR) {
 		dma_unmap_single(dev, *slot, PFE_PKT_SIZE, DMA_FROM_DEVICE);
-		*slot = 0;
+		*slot = DMA_MAPPING_ERROR;
 	}
 }
 

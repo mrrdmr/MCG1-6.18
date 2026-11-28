@@ -1068,33 +1068,28 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 	/*
 	 * Do not acquire hif->tx_lock here: hif_lib_xmit_pkt_sg() takes
 	 * hif->tx_lock internally (spin_lock_bh() is non-reentrant, and
-	 * lock order is tx_clean_lock -> hif->tx_lock).
-	 *
-	 * Account bytes in BQL before submitting to HIF so a completion IRQ
-	 * on another CPU cannot call netdev_completed_queue() ahead of
-	 * netdev_sent_queue(). Roll back under tx_clean_lock on failure.
+	 * lock order is tx_clean_lock -> hif->tx_lock). BQL accounting is
+	 * also performed inside hif_lib_xmit_pkt_sg() under hif->tx_lock.
 	 */
-	netdev_sent_queue(dev, pkt_len);
 	rc = hif_lib_xmit_pkt_sg(&priv->client, PFE_ETH_TXQ,
 				 skb->data, skb_headlen(skb),
 				 frag_segs, nr_frag_segs, ctrl, skb,
 				 dev, pkt_len);
 	if (unlikely(rc)) {
 		pfe_eth_unmap_frag_segs(dma_dev, frag_segs, nr_frag_segs);
-		spin_lock_bh(&priv->tx_clean_lock);
-		netdev_completed_queue(dev, 1, pkt_len);
 		if (rc == -EBUSY) {
 			priv->sw_stats.tx_busy_retries++;
+			spin_lock_bh(&priv->tx_clean_lock);
 			__pfe_eth_tx_post_xmit(priv, EMAC_TXQ_DEPTH,
 						PFE_TX_STOP_THRES, true);
 			spin_unlock_bh(&priv->tx_clean_lock);
 			return NETDEV_TX_BUSY;
 		}
-		spin_unlock_bh(&priv->tx_clean_lock);
 		dev_kfree_skb_any(skb);
 		dev->stats.tx_dropped++;
 		return NETDEV_TX_OK;
 	}
+
 
 	dev_sw_netstats_tx_add(dev, 1, pkt_len);
 	if (nr_frag_segs) {
