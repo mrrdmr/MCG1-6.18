@@ -383,6 +383,7 @@ static void pfe_phy_restore_led_mode(struct phy_device *phydev)
 	 */
 	u16 leds1 = BCM54XX_SHD_LEDS1_LED1(BCM_LED_SRC_LINKSPD1) |
 		    BCM54XX_SHD_LEDS1_LED3(BCM_LED_SRC_LINKSPD2);
+	int ecr;
 
 	phy_write(phydev, MII_BCM54XX_SHD,
 		  MII_BCM54XX_SHD_WRITE | MII_BCM54XX_SHD_VAL(BCM54XX_SHD_LEDS1) |
@@ -394,7 +395,11 @@ static void pfe_phy_restore_led_mode(struct phy_device *phydev)
 	 * ever using a real hardware IRQ line for this PHY either way --
 	 * see git log for the full writeup). Clear it to match; harmless.
 	 */
-	phy_write(phydev, MII_BCM54XX_ECR, phy_read(phydev, MII_BCM54XX_ECR) & ~MII_BCM54XX_ECR_IM);
+	ecr = phy_read(phydev, MII_BCM54XX_ECR);
+	if (ecr < 0)
+		netdev_warn(phydev->attached_dev, "failed to read PHY ECR: %d\n", ecr);
+	else
+		phy_write(phydev, MII_BCM54XX_ECR, ecr & ~MII_BCM54XX_ECR_IM);
 
 	/* LEDS2 (LED0/LED2, "ACT"): deliberately left untouched -- this one
 	 * already works correctly on hardware defaults with no software
@@ -543,7 +548,11 @@ static void __pfe_eth_reap_txq(struct pfe_eth_priv_s *priv, int qno, int count)
 		}
 	}
 
-	if (completed_pkts)
+	/*
+	 * Skip netdev_completed_queue() if BQL was already reset during
+	 * pfe_eth_close() (marked by tx_wake_thres == 0).
+	 */
+	if (completed_pkts && likely(priv->tx_wake_thres))
 		netdev_completed_queue(dev, completed_pkts, completed_bytes);
 }
 
@@ -835,7 +844,10 @@ static int pfe_eth_open(struct net_device *dev)
 	if (priv->phydev)
 		pfe_phy_restore_led_mode(priv->phydev);
 
+	spin_lock_bh(&priv->tx_clean_lock);
+	priv->tx_wake_thres = PFE_TX_WAKE_THRES;
 	netdev_reset_queue(dev);
+	spin_unlock_bh(&priv->tx_clean_lock);
 	netif_start_queue(dev);
 
 	return 0;
@@ -880,17 +892,23 @@ static int pfe_eth_close(struct net_device *dev)
 		usleep_range(100, 200);
 	}
 
+	spin_lock_bh(&priv->tx_clean_lock);
 	if (unlikely(READ_ONCE(q->tx_pending))) {
 		netdev_warn(dev, "closing with %u pending TX descriptors\n",
 			    READ_ONCE(q->tx_pending));
-		spin_lock_bh(&priv->tx_clean_lock);
 		hif_tx_lock(&priv->pfe->hif);
 		pfe_hif_tx_orphan_client(&priv->pfe->hif, priv->client.id, q);
 		hif_tx_unlock(&priv->pfe->hif);
-		spin_unlock_bh(&priv->tx_clean_lock);
 	}
-
+	/*
+	 * Mark BQL reset (tx_wake_thres = 0) before unlocking so any late
+	 * TX completion arriving before hif_lib_client_unregister() frees
+	 * its skb without calling netdev_completed_queue() on a reset queue.
+	 */
+	priv->tx_wake_thres = 0;
 	netdev_reset_queue(dev);
+	spin_unlock_bh(&priv->tx_clean_lock);
+
 	pfe_hif_release_tx_irq(&priv->pfe->hif, priv->client.id);
 
 	hif_lib_client_unregister(&priv->client);
@@ -924,6 +942,7 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 	struct pfe_tx_sg_seg frag_segs[PFE_TX_MAX_SG_DESCS - 1];
 	unsigned int nr_frag_segs = 0;
 	unsigned int pkt_len = skb->len;
+	unsigned int req_descs = 1;
 	u32 ctrl = 0;
 	int rc;
 
@@ -950,6 +969,23 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 				need_linearize = true;
 		}
 
+		if (!need_linearize)
+			req_descs = est_descs;
+
+		/*
+		 * Check ring space before modifying skb or mapping DMA pages
+		 * so NETDEV_TX_BUSY returns an unmodified skb.
+		 */
+		if (unlikely(hif_lib_tx_avail(&priv->client, PFE_ETH_TXQ) < req_descs)) {
+			priv->sw_stats.tx_busy_retries++;
+			spin_lock_bh(&priv->tx_clean_lock);
+			__pfe_eth_tx_post_xmit(priv, EMAC_TXQ_DEPTH,
+						max_t(unsigned int, PFE_TX_STOP_THRES, req_descs),
+						true);
+			spin_unlock_bh(&priv->tx_clean_lock);
+			return NETDEV_TX_BUSY;
+		}
+
 		if (need_linearize) {
 			priv->sw_stats.tx_sg_linearized++;
 			if (skb_linearize(skb)) {
@@ -958,6 +994,13 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 				return NETDEV_TX_OK;
 			}
 		}
+	} else if (unlikely(hif_lib_tx_avail(&priv->client, PFE_ETH_TXQ) < req_descs)) {
+		priv->sw_stats.tx_busy_retries++;
+		spin_lock_bh(&priv->tx_clean_lock);
+		__pfe_eth_tx_post_xmit(priv, EMAC_TXQ_DEPTH,
+					PFE_TX_STOP_THRES, true);
+		spin_unlock_bh(&priv->tx_clean_lock);
+		return NETDEV_TX_BUSY;
 	}
 
 	if (skb_headlen(skb) < min_t(unsigned int, pkt_len, PFE_TX_MIN_HEADLEN) &&
@@ -1026,21 +1069,28 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 	 * Do not acquire hif->tx_lock here: hif_lib_xmit_pkt_sg() takes
 	 * hif->tx_lock internally (spin_lock_bh() is non-reentrant, and
 	 * lock order is tx_clean_lock -> hif->tx_lock).
+	 *
+	 * Account bytes in BQL before submitting to HIF so a completion IRQ
+	 * on another CPU cannot call netdev_completed_queue() ahead of
+	 * netdev_sent_queue(). Roll back under tx_clean_lock on failure.
 	 */
+	netdev_sent_queue(dev, pkt_len);
 	rc = hif_lib_xmit_pkt_sg(&priv->client, PFE_ETH_TXQ,
 				 skb->data, skb_headlen(skb),
 				 frag_segs, nr_frag_segs, ctrl, skb,
 				 dev, pkt_len);
 	if (unlikely(rc)) {
 		pfe_eth_unmap_frag_segs(dma_dev, frag_segs, nr_frag_segs);
+		spin_lock_bh(&priv->tx_clean_lock);
+		netdev_completed_queue(dev, 1, pkt_len);
 		if (rc == -EBUSY) {
 			priv->sw_stats.tx_busy_retries++;
-			spin_lock_bh(&priv->tx_clean_lock);
 			__pfe_eth_tx_post_xmit(priv, EMAC_TXQ_DEPTH,
 						PFE_TX_STOP_THRES, true);
 			spin_unlock_bh(&priv->tx_clean_lock);
 			return NETDEV_TX_BUSY;
 		}
+		spin_unlock_bh(&priv->tx_clean_lock);
 		dev_kfree_skb_any(skb);
 		dev->stats.tx_dropped++;
 		return NETDEV_TX_OK;
