@@ -37,7 +37,7 @@ unsigned int pfe_pkt_headroom = PFE_PKT_HEADROOM;
 static struct hif_shm ghif_shm;
 
 /* Spare Rx buffer pool (HIF_RX_DESC_NT entries) keeps allocator calls off
- * the hot RX path, with a GFP_ATOMIC fallback when empty.
+ * the hot RX path, falling back to pfe_hif_buf_alloc() when empty.
  */
 static void *ghif_spare_buf[HIF_RX_DESC_NT];
 static int ghif_spare_buf_count;
@@ -449,8 +449,13 @@ int hif_lib_xmit_pkt_sg(struct hif_client_s *client, unsigned int qno,
 		WRITE_ONCE(desc->ctrl, CL_DESC_OWN | CL_DESC_FLAGS(desc_flags));
 	}
 
+	if (dev)
+		netdev_sent_queue(dev, pkt_len);
+
 	rc = __hif_xmit_pkt_sg(hif, client->id, qno, segs, nr_descs);
 	if (unlikely(rc)) {
+		if (dev)
+			netdev_completed_queue(dev, 1, pkt_len);
 		for (i = 0; i < nr_descs; i++) {
 			unsigned int cur = (widx + i) & (queue->size - 1);
 
@@ -461,9 +466,6 @@ int hif_lib_xmit_pkt_sg(struct hif_client_s *client, unsigned int qno,
 		dma_unmap_single(hif->dev, segs[0].dma, segs[0].len, DMA_TO_DEVICE);
 		return rc;
 	}
-
-	if (dev)
-		netdev_sent_queue(dev, pkt_len);
 
 	queue->write_idx = (widx + nr_descs) & (queue->size - 1);
 	queue->tx_pending += nr_descs;
@@ -528,7 +530,7 @@ void *hif_lib_receive_pkt(struct hif_client_s *client, int qno, int *len, int *o
 	struct hif_client_rx_queue *queue;
 	struct rx_queue_desc *desc;
 	void *pkt = NULL;
-	u32 ctrl;
+	u32 ctrl, desc_len;
 
 	if (unlikely(!client || qno < 0 || qno >= client->rx_qn))
 		return NULL;
@@ -537,6 +539,7 @@ void *hif_lib_receive_pkt(struct hif_client_s *client, int qno, int *len, int *o
 	if (unlikely(!queue->base))
 		return NULL;
 
+again:
 	desc = queue->base + queue->read_idx;
 
 	ctrl = READ_ONCE(desc->ctrl);
@@ -549,6 +552,17 @@ void *hif_lib_receive_pkt(struct hif_client_s *client, int qno, int *len, int *o
 	if (unlikely(!desc->data))
 		return NULL;
 
+	desc_len = CL_DESC_BUF_LEN(ctrl);
+	if (unlikely(desc_len > pfe_pkt_size ||
+		     ((ctrl & CL_DESC_FIRST) && desc_len < PFE_PKT_HEADER_SZ))) {
+		pfe_hif_spare_buf_put(desc->data);
+		desc->data = NULL;
+		smp_wmb();
+		WRITE_ONCE(desc->ctrl, CL_DESC_BUF_LEN(pfe_pkt_size) | CL_DESC_OWN);
+		queue->read_idx = (queue->read_idx + 1) & (queue->size - 1);
+		goto again;
+	}
+
 	pkt = desc->data - pfe_pkt_headroom;
 
 	*rx_ctrl = desc->client_ctrl;
@@ -557,17 +571,26 @@ void *hif_lib_receive_pkt(struct hif_client_s *client, int qno, int *len, int *o
 	if (ctrl & CL_DESC_FIRST) {
 		u16 size = *rx_ctrl >> 24;
 
+		if (unlikely(desc_len < PFE_PKT_HEADER_SZ + size)) {
+			pfe_hif_spare_buf_put(desc->data);
+			desc->data = NULL;
+			smp_wmb();
+			WRITE_ONCE(desc->ctrl, CL_DESC_BUF_LEN(pfe_pkt_size) | CL_DESC_OWN);
+			queue->read_idx = (queue->read_idx + 1) & (queue->size - 1);
+			goto again;
+		}
+
 		if (size) {
-			*len = CL_DESC_BUF_LEN(ctrl) - PFE_PKT_HEADER_SZ - size;
+			*len = desc_len - PFE_PKT_HEADER_SZ - size;
 			*ofst = pfe_pkt_headroom + PFE_PKT_HEADER_SZ + size;
 			*priv_data = desc->data + PFE_PKT_HEADER_SZ;
 		} else {
-			*len = CL_DESC_BUF_LEN(ctrl) - PFE_PKT_HEADER_SZ;
+			*len = desc_len - PFE_PKT_HEADER_SZ;
 			*ofst = pfe_pkt_headroom + PFE_PKT_HEADER_SZ;
 			*priv_data = NULL;
 		}
 	} else {
-		*len = CL_DESC_BUF_LEN(ctrl);
+		*len = desc_len;
 		*ofst = pfe_pkt_headroom;
 	}
 
@@ -587,6 +610,7 @@ int hif_lib_event_handler_start(struct hif_client_s *client, int event, int qno)
 		return -1;
 
 	test_and_clear_bit(qno, &client->queue_mask[event]);
+	smp_mb__after_atomic();
 
 	switch (event) {
 	case EVENT_RX_PKT_IND: {
@@ -604,6 +628,29 @@ int hif_lib_event_handler_start(struct hif_client_s *client, int event, int qno)
 
 		if (!(READ_ONCE(desc->ctrl) & CL_DESC_OWN))
 			hif_lib_indicate_client(client->id, EVENT_RX_PKT_IND, qno);
+		break;
+	}
+	case EVENT_TXDONE_IND: {
+		struct hif_client_tx_queue *queue;
+		struct pfe_hif *hif;
+		bool has_done = false;
+
+		if (!client->pfe || qno >= client->tx_qn)
+			return -1;
+
+		queue = &client->tx_q[qno];
+		if (unlikely(!queue->base))
+			return -1;
+
+		hif = &client->pfe->hif;
+		spin_lock_bh(&hif->tx_lock);
+		if (queue->tx_pending &&
+		    !(READ_ONCE(queue->base[queue->read_idx].ctrl) & CL_DESC_OWN))
+			has_done = true;
+		spin_unlock_bh(&hif->tx_lock);
+
+		if (has_done)
+			hif_lib_indicate_client(client->id, EVENT_TXDONE_IND, qno);
 		break;
 	}
 	default:
