@@ -309,12 +309,24 @@ static void pfe_hif_client_unregister(struct pfe_hif *hif, u32 client_id)
 void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 			      struct hif_client_tx_queue *q)
 {
+	unsigned int q_no = HIF_CLIENT_QUEUES_MAX;
 	unsigned int active, idx, i = 0;
 
 	lockdep_assert_held(&hif->tx_lock);
 
 	if (unlikely(!q || !q->base))
 		return;
+
+	if (client_id < HIF_CLIENTS_MAX) {
+		unsigned int qidx;
+
+		for (qidx = 0; qidx < hif->client[client_id].tx_qn; qidx++) {
+			if (hif->client[client_id].tx_q[qidx].base == q->base) {
+				q_no = qidx;
+				break;
+			}
+		}
+	}
 
 	active = hif->TxRingSize - hif->TxAvail;
 	idx = hif->Txtoclean;
@@ -333,6 +345,8 @@ void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 
 				i++;
 				if (desc_sw->client_id != client_id)
+					continue;
+				if (q_no < HIF_CLIENT_QUEUES_MAX && desc_sw->q_no != q_no)
 					continue;
 
 				desc_sw->client_id = HIF_CLIENTS_MAX;
@@ -355,9 +369,11 @@ void pfe_hif_tx_orphan_client(struct pfe_hif *hif, unsigned int client_id,
 
 	for (; i < active; i++) {
 		unsigned int cur = (idx + i) & (hif->TxRingSize - 1);
+		struct hif_desc_sw *desc_sw = &hif->tx_sw_queue[cur];
 
-		if (hif->tx_sw_queue[cur].client_id == client_id)
-			hif->tx_sw_queue[cur].client_id = HIF_CLIENTS_MAX;
+		if (desc_sw->client_id == client_id &&
+		    (q_no >= HIF_CLIENT_QUEUES_MAX || desc_sw->q_no == q_no))
+			desc_sw->client_id = HIF_CLIENTS_MAX;
 	}
 }
 
@@ -433,6 +449,23 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 			ctrl = READ_ONCE(desc->ctrl);
 			if (ctrl & BD_CTRL_DESC_EN)
 				break;
+		}
+
+		/*
+		 * Recover a slot that was left disabled/unmapped on an earlier
+		 * DMA-mapping failure instead of parsing it as a 0-byte packet.
+		 */
+		if (unlikely(!READ_ONCE(desc->data))) {
+			void *buf = hif->rx_buf_addr[rtc];
+
+			if (!buf || (!pfe_hif_buf_dma(buf) && !pfe_hif_buf_map(hif->dev, buf)))
+				break;
+
+			desc->data = lower_32_bits(pfe_hif_buf_dma(buf));
+			wmb();
+			WRITE_ONCE(desc->ctrl, BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM |
+				   BD_CTRL_DIR | BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size));
+			break;
 		}
 
 		/* Ensure DMA writes to packet buffer complete before reading it. */
@@ -531,12 +564,12 @@ pkt_drop:
 			WARN_ON_ONCE(1);
 			desc->data = 0;
 			wmb();
-			desc->ctrl = 0;	/* leave it disabled rather than DMA to 0 */
+			WRITE_ONCE(desc->ctrl, 0);	/* leave disabled until recovered */
 		} else {
 			desc->data = lower_32_bits(pfe_hif_buf_dma(free_buf));
 			wmb();
-			desc->ctrl = BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM | BD_CTRL_DIR |
-				     BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size);
+			WRITE_ONCE(desc->ctrl, BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM | BD_CTRL_DIR |
+				   BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size));
 		}
 
 		inc_hif_rxidx(rtc);
@@ -622,6 +655,7 @@ void __hif_tx_done_process(struct pfe_hif *hif, int count)
 		}
 
 		client_ack_txpacket(hif, desc_sw->client_id, desc_sw->q_no);
+		desc_sw->client_id = HIF_CLIENTS_MAX;
 
 		inc_hif_txidx(ttc);
 		tx_avl++;
@@ -645,6 +679,11 @@ int __hif_xmit_pkt_sg(struct pfe_hif *hif, unsigned int client_id, unsigned int 
 
 	if (unlikely(!nr_descs || nr_descs > hif->TxRingSize))
 		return -EINVAL;
+
+	for (i = 0; i < nr_descs; i++) {
+		if (unlikely(!segs[i].len || segs[i].len > 0xFFFF))
+			return -EINVAL;
+	}
 
 	if (unlikely(hif->TxAvail < nr_descs)) {
 		__hif_tx_done_process(hif, TX_FREE_MAX_COUNT);
@@ -686,11 +725,11 @@ int __hif_xmit_pkt_sg(struct pfe_hif *hif, unsigned int client_id, unsigned int 
 		if (i == 0)
 			first_ctrl = ctrl;
 		else
-			desc->ctrl = ctrl;
+			WRITE_ONCE(desc->ctrl, ctrl);
 	}
 
 	wmb();
-	first_desc->ctrl = first_ctrl;
+	WRITE_ONCE(first_desc->ctrl, first_ctrl);
 
 	hif->Txtosend = (start_idx + nr_descs) & (hif->TxRingSize - 1);
 	hif->TxAvail -= nr_descs;
@@ -853,7 +892,8 @@ static int pfe_hif_rx_poll(struct napi_struct *napi, int budget)
 		}
 		spin_unlock_irqrestore(&hif->irq_lock, flags);
 	} else {
-		hif->napi_counters[NAPI_FULL_BUDGET_COUNT]++;
+		if (work_done >= budget)
+			hif->napi_counters[NAPI_FULL_BUDGET_COUNT]++;
 		return budget;
 	}
 
@@ -932,8 +972,6 @@ void pfe_hif_exit(struct pfe *pfe)
 	struct pfe_hif *hif = &pfe->hif;
 	unsigned long flags;
 
-	hif->shm->gClient_status = 0;
-
 	spin_lock_irqsave(&hif->irq_lock, flags);
 	writel(0, HIF_INT_ENABLE);
 	writel(readl(HIF_INT_SRC), HIF_INT_SRC);
@@ -941,16 +979,18 @@ void pfe_hif_exit(struct pfe *pfe)
 
 	devm_free_irq(hif->dev, hif->irq, hif);
 
-	gpi_disable(HGPI_BASE_ADDR);
-	hif_rx_disable();
-	hif_tx_disable();
-
 	napi_disable(&hif->napi);
 
 	spin_lock_irqsave(&hif->irq_lock, flags);
 	writel(0, HIF_INT_ENABLE);
 	writel(readl(HIF_INT_SRC), HIF_INT_SRC);
 	spin_unlock_irqrestore(&hif->irq_lock, flags);
+
+	gpi_disable(HGPI_BASE_ADDR);
+	hif_rx_disable();
+	hif_tx_disable();
+
+	hif->shm->gClient_status = 0;
 
 	netif_napi_del(&hif->napi);
 	free_netdev(hif->dummy_dev);
